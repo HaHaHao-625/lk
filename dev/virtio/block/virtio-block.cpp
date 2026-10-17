@@ -119,23 +119,23 @@ constexpr uint32_t VIRTIO_BLK_F_ZONED = (1 << 17);
 
 constexpr uint32_t VIRTIO_BLK_T_IN = 0;
 constexpr uint32_t VIRTIO_BLK_T_OUT = 1;
-constexpr uint32_t VIRTIO_BLK_T_FLUSH = 4;
-constexpr uint32_t VIRTIO_BLK_T_GET_ID = 8;
-constexpr uint32_t VIRTIO_BLK_T_GET_LIFETIME = 10;
-constexpr uint32_t VIRTIO_BLK_T_DISCARD = 11;
-constexpr uint32_t VIRTIO_BLK_T_WRITE_ZEROES = 13;
-constexpr uint32_t VIRTIO_BLK_T_SECURE_ERASE = 14;
-constexpr uint32_t VIRTIO_BLK_T_ZONE_APPEND = 15;
-constexpr uint32_t VIRTIO_BLK_T_ZONE_REPORT = 16;
-constexpr uint32_t VIRTIO_BLK_T_ZONE_OPEN = 17;
-constexpr uint32_t VIRTIO_BLK_T_ZONE_CLOSE = 18;
-constexpr uint32_t VIRTIO_BLK_T_ZONE_FINISH = 19;
-constexpr uint32_t VIRTIO_BLK_T_ZONE_RESET = 24;
-constexpr uint32_t VIRTIO_BLK_T_ZONE_RESET_ALL = 26;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_FLUSH = 4;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_GET_ID = 8;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_GET_LIFETIME = 10;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_DISCARD = 11;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_WRITE_ZEROES = 13;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_SECURE_ERASE = 14;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_ZONE_APPEND = 15;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_ZONE_REPORT = 16;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_ZONE_OPEN = 17;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_ZONE_CLOSE = 18;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_ZONE_FINISH = 19;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_ZONE_RESET = 24;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_T_ZONE_RESET_ALL = 26;
 
 constexpr uint32_t VIRTIO_BLK_S_OK = 0;
-constexpr uint32_t VIRTIO_BLK_S_IOERR = 1;
-constexpr uint32_t VIRTIO_BLK_S_UNSUPP = 2;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_S_IOERR = 1;
+__MAYBE_UNUSED constexpr uint32_t VIRTIO_BLK_S_UNSUPP = 2;
 
 constexpr uint16_t VIRTIO_BLK_RING_LEN = 256;
 
@@ -255,6 +255,13 @@ status_t virtio_block_init(virtio_device *dev) {
                              VIRTIO_BLK_F_TOPOLOGY |
                              VIRTIO_BLK_F_CONFIG_WCE);
     dev->bus()->virtio_set_guest_features(0, bdev->guest_features);
+
+    /* confirm the feature set before touching the config space or the queue */
+    status_t err = dev->bus()->virtio_status_features_ok();
+    if (err != NO_ERROR) {
+        TRACEF("virtio-block: device rejected feature negotiation\n");
+        return err;
+    }
 
     // If supported, prefer writeback mode for better throughput.
     if (bdev->guest_features & VIRTIO_BLK_F_CONFIG_WCE) {
@@ -386,7 +393,7 @@ enum handler_return virtio_block_irq_driver_callback(virtio_device *dev, uint ri
         // async
         ssize_t result =
             (txn->status == VIRTIO_BLK_S_OK) ? (ssize_t)txn->len : ERR_IO;
-        LTRACEF("calling callback %p with cookie %p, len %ld\n", txn->callback,
+        LTRACEF("calling callback %p with cookie %p, len %zd\n", txn->callback,
                 txn->cookie, result);
         txn->callback(txn->cookie, &bdev->bdev, result);
     }

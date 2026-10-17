@@ -1,6 +1,14 @@
 ifndef ARCH_arm_TOOLCHAIN_INCLUDED
 ARCH_arm_TOOLCHAIN_INCLUDED := 1
 
+ifeq ($(TOOLCHAIN),clang)
+CLANG_CC := $(if $(CLANG_BINDIR),$(CLANG_BINDIR)/)clang
+FOUNDTOOL=$(shell which $(CLANG_CC) 2>/dev/null)
+ifndef ARCH_arm_TOOLCHAIN_PREFIX
+ARCH_arm_TOOLCHAIN_PREFIX := arm-eabi-
+endif
+else
+
 # try to find the toolchain
 ifndef ARCH_arm_TOOLCHAIN_PREFIX
 
@@ -45,6 +53,7 @@ endif # arm-linux-gnueabi-
 else
 FOUNDTOOL=$(shell which $(ARCH_arm_TOOLCHAIN_PREFIX)gcc)
 endif # ARCH_arm_TOOLCHAIN_PREFIX
+endif # TOOLCHAIN == clang
 
 ifeq ($(FOUNDTOOL),)
 $(warning cannot find toolchain in path, assuming arm-eabi- prefix)
@@ -72,17 +81,19 @@ ifeq ($(ARM_CPU),cortex-m55)
 ARCH_arm_COMPILEFLAGS += -mcpu=$(ARM_CPU)
 endif
 ifeq ($(ARM_CPU),cortex-m7)
-# use cortex-m4 for now until better general toolchain support
-ARCH_arm_COMPILEFLAGS += -mcpu=cortex-m4
+ARCH_arm_COMPILEFLAGS += -mcpu=cortex-m7
 endif
 ifeq ($(ARM_CPU),cortex-m7-fpu-sp-d16)
-# use cortex-m4 for now until better general toolchain support
-ARCH_arm_COMPILEFLAGS += -mcpu=cortex-m4
-ARCH_arm_COMPILEFLAGS_FLOAT += -mfpu=fpv4-sp-d16 -mfloat-abi=softfp
+ARCH_arm_COMPILEFLAGS += -mcpu=cortex-m7
+ARCH_arm_COMPILEFLAGS_FLOAT += -mfpu=fpv5-sp-d16 -mfloat-abi=softfp
 endif
 ifeq ($(ARM_CPU),cortex-m4f)
 ARCH_arm_COMPILEFLAGS += -mcpu=cortex-m4
 ARCH_arm_COMPILEFLAGS_FLOAT += -mfpu=fpv4-sp-d16 -mfloat-abi=softfp
+endif
+ifeq ($(ARM_CPU),cortex-m33f)
+ARCH_arm_COMPILEFLAGS += -mcpu=cortex-m33
+ARCH_arm_COMPILEFLAGS_FLOAT += -mfpu=fpv5-sp-d16 -mfloat-abi=softfp
 endif
 ifeq ($(ARM_CPU),cortex-a7)
 ARCH_arm_COMPILEFLAGS += -mcpu=$(ARM_CPU)

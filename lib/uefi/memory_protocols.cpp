@@ -21,6 +21,7 @@
 #include <arch/mmu.h>
 #include <kernel/vm.h>
 #include <lib/dlmalloc.h>
+#include <lk/err.h>
 #include <lk/trace.h>
 #include <stdio.h>
 #include <string.h>
@@ -114,8 +115,13 @@ __WEAK void *alloc_page(size_t size, size_t align_log2) {
     printf("Failed to allocate physical memory size %zu\n", size);
     return nullptr;
   }
-  int ret = arch_mmu_map(&aspace->arch_aspace, pa, pa, size / PAGE_SIZE, 0);
-  if (ret != 0) {
+  // the program's code and data both live here
+  vmm_aspace_lock(aspace);
+  status_t ret = arch_mmu_map(&aspace->arch_aspace, pa, pa, size / PAGE_SIZE,
+                              ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE |
+                                  ARCH_MMU_FLAG_PERM_EXECUTE);
+  vmm_aspace_unlock(aspace);
+  if (ret != NO_ERROR) {
     printf("Failed to arch_mmu_map(0x%lx)\n", pa);
     return nullptr;
   }
@@ -134,24 +140,37 @@ __WEAK void *alloc_page(void *addr, size_t size, size_t align_log2) {
   }
   auto aspace = set_boot_aspace();
   size = ROUNDUP(size, PAGE_SIZE);
-  struct list_node list;
-  size_t allocated =
-      pmm_alloc_range(reinterpret_cast<paddr_t>(addr), size, &list);
-  if (allocated != size / PAGE_SIZE) {
+  const uint page_count = static_cast<uint>(size / PAGE_SIZE);
+  struct list_node pages;
+  list_initialize(&pages);
+  size_t allocated = pmm_alloc_range(reinterpret_cast<paddr_t>(addr),
+                                     page_count, &pages);
+  if (allocated != page_count) {
+    pmm_free(&pages);
     printf(
         "Failed to allocate physical memory size %zu at specified address %p "
         "fallback to regular allocation\n",
         size, addr);
     return alloc_page(size, align_log2);
   }
-  status_t err{};
-  err = vmm_reserve_space(aspace, "uefi_program", size,
-                          reinterpret_cast<vaddr_t>(addr));
-  if (err) {
-    printf("Failed to vmm_reserve_space for uefi program %d\n", err);
+
+  void *mapped_addr = addr;
+  status_t err = vmm_alloc_physical(
+      aspace, "uefi_program", size, &mapped_addr, align_log2,
+      reinterpret_cast<paddr_t>(addr), VMM_FLAG_VALLOC_SPECIFIC,
+      ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE |
+          ARCH_MMU_FLAG_PERM_EXECUTE);
+  if (err != NO_ERROR) {
+    pmm_free(&pages);
+    printf("Failed to map physical memory at %p for uefi program %d\n", addr,
+           err);
     return nullptr;
   }
-  return addr;
+
+  // vmm_alloc_physical() does not own PMM pages. Unlink them from this stack
+  // list; free_pages() reconstructs and releases the list after unmapping.
+  while (list_remove_head(&pages)) {}
+  return mapped_addr;
 }
 
 EfiStatus allocate_pages(EfiAllocatorType type, EfiMemoryType memory_type,
@@ -197,11 +216,19 @@ __WEAK EfiStatus free_pool(void *mem) {
 }
 
 __WEAK EfiStatus free_pages(void *memory, size_t pages) {
-  auto pa = reinterpret_cast<void *>(vaddr_to_paddr(memory));
-  if (pa != memory) {
+  auto pa = vaddr_to_paddr(memory);
+  if (pa != reinterpret_cast<paddr_t>(memory)) {
     printf("WARN: virtual address %p is not identity mapped, physical addr: "
            "%p\n",
-           memory, pa);
+           memory, reinterpret_cast<void *>(pa));
+  }
+  // pmm_free_kpages expects a kernel virtual address. Keep the permanent
+  // kernel mapping before removing the UEFI identity mapping below.
+  auto kernel_memory = paddr_to_kvaddr(pa);
+  if (kernel_memory == nullptr) {
+    printf("Failed to find kernel mapping for physical pages %p %zu\n",
+           reinterpret_cast<void *>(pa), pages);
+    return EFI_STATUS_DEVICE_ERROR;
   }
   status_t err =
       vmm_free_region(set_boot_aspace(), reinterpret_cast<vaddr_t>(memory));
@@ -210,10 +237,10 @@ __WEAK EfiStatus free_pages(void *memory, size_t pages) {
            pages);
     return EFI_STATUS_DEVICE_ERROR;
   }
-  auto pages_freed = pmm_free_kpages(pa, pages);
+  auto pages_freed = pmm_free_kpages(kernel_memory, pages);
   if (pages_freed != pages) {
-    printf("Failed to free physical pages %p %zu, only freed %zu pages\n", pa,
-           pages, pages_freed);
+    printf("Failed to free physical pages %p %zu, only freed %zu pages\n",
+           reinterpret_cast<void *>(pa), pages, pages_freed);
     return EFI_STATUS_DEVICE_ERROR;
   }
   return EFI_STATUS_SUCCESS;
@@ -274,45 +301,41 @@ EfiStatus sync_partition_buffer(struct GblEfiBootMemoryProtocol* self,
   return EFI_STATUS_SUCCESS;
 }
 
+struct BootBufferSlot {
+  GblEfiBootBufferType type;
+  size_t size;
+  size_t align_log2;
+  void* addr;
+};
+
+// 2^21 = 2MB alignment on the load/kernel buffers, required by linux kernel
+BootBufferSlot boot_buffer_slots[] = {
+    {GBL_EFI_BOOT_BUFFER_TYPE_GENERAL_LOAD, 128ul * 1024 * 1024, 21, nullptr},
+    {GBL_EFI_BOOT_BUFFER_TYPE_KERNEL, 64ul * 1024 * 1024, 21, nullptr},
+    {GBL_EFI_BOOT_BUFFER_TYPE_RAMDISK, 64ul * 1024 * 1024, PAGE_SIZE_SHIFT,
+     nullptr},
+    {GBL_EFI_BOOT_BUFFER_TYPE_FDT, 2ul * 1024 * 1024, PAGE_SIZE_SHIFT,
+     nullptr},
+    {GBL_EFI_BOOT_BUFFER_TYPE_PVMFW_DATA, 1024ul * 1024, PAGE_SIZE_SHIFT,
+     nullptr},
+};
+
 EfiStatus get_boot_buffer(struct GblEfiBootMemoryProtocol* self,
                           /* in */ GblEfiBootBufferType buf_type,
                           /* out */ size_t* size,
                           /* out */ void** addr) {
-  if (buf_type == GBL_EFI_BOOT_BUFFER_TYPE_GENERAL_LOAD) {
-    *size = 128ul * 1024 * 1024;
-    // 2^21 = 2MB alignment, required by linux kernel
-    *addr = alloc_page(*size, 21);
-    if (*addr == nullptr) {
+  for (auto& slot : boot_buffer_slots) {
+    if (slot.type != buf_type) {
+      continue;
+    }
+    if (slot.addr == nullptr) {
+      slot.addr = alloc_page(slot.size, slot.align_log2);
+    }
+    if (slot.addr == nullptr) {
       return EFI_STATUS_OUT_OF_RESOURCES;
     }
-    return EFI_STATUS_SUCCESS;
-  } else if (buf_type == GBL_EFI_BOOT_BUFFER_TYPE_KERNEL) {
-    *size = 64ul * 1024 * 1024;
-    *addr = alloc_page(*size, 21);
-    if (*addr == nullptr) {
-      return EFI_STATUS_OUT_OF_RESOURCES;
-    }
-    return EFI_STATUS_SUCCESS;
-  } else if (buf_type == GBL_EFI_BOOT_BUFFER_TYPE_RAMDISK) {
-    *size = 64ul * 1024 * 1024;
-    *addr = alloc_page(*size, PAGE_SIZE_SHIFT);
-    if (*addr == nullptr) {
-      return EFI_STATUS_OUT_OF_RESOURCES;
-    }
-    return EFI_STATUS_SUCCESS;
-  } else if (buf_type == GBL_EFI_BOOT_BUFFER_TYPE_FDT) {
-    *size = 2ul * 1024 * 1024;
-    *addr = alloc_page(*size, PAGE_SIZE_SHIFT);
-    if (*addr == nullptr) {
-      return EFI_STATUS_OUT_OF_RESOURCES;
-    }
-    return EFI_STATUS_SUCCESS;
-  } else if (buf_type == GBL_EFI_BOOT_BUFFER_TYPE_PVMFW_DATA) {
-    *size = 1024ul * 1024;
-    *addr = alloc_page(*size, PAGE_SIZE_SHIFT);
-    if (*addr == nullptr) {
-      return EFI_STATUS_OUT_OF_RESOURCES;
-    }
+    *size = slot.size;
+    *addr = slot.addr;
     return EFI_STATUS_SUCCESS;
   }
   printf("get_boot_buffer(%d, %zu) unsupported\n", buf_type, *size);
@@ -320,6 +343,25 @@ EfiStatus get_boot_buffer(struct GblEfiBootMemoryProtocol* self,
 }
 
 }  // namespace
+
+void release_boot_buffers() {
+  for (auto& slot : boot_buffer_slots) {
+    if (slot.addr == nullptr) {
+      continue;
+    }
+    // Teardown destroys the UEFI address space (reset_heap() runs right after
+    // this), so a retained pointer would be handed back by get_boot_buffer() on
+    // the next run with no valid mapping. Always drop the slot so a fresh,
+    // remapped buffer is allocated next time. free_pages() should succeed now
+    // that pages are returned via paddr_to_kvaddr(); if it ever fails we log it
+    // (the physical pages leak) rather than keep an unusable mapping reusable.
+    if (free_pages(slot.addr, slot.size / PAGE_SIZE) != EFI_STATUS_SUCCESS) {
+      printf("release_boot_buffers: failed to free %p (%zu bytes); dropping "
+             "slot anyway\n", slot.addr, slot.size);
+    }
+    slot.addr = nullptr;
+  }
+}
 
 __WEAK GblEfiBootMemoryProtocol* open_boot_memory_protocol() {
   static GblEfiBootMemoryProtocol protocol = {

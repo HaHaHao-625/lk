@@ -267,7 +267,15 @@ FUNCTION(arm64_reset)
     b       .Lmap_range_one_table_loop
 
 .Linitial_mapping_done:
-    /* compute the base TCR configuration and save away in a global for future use */
+    /*
+     * Compute the base TCR configuration and save it in arm64_mmu_tcr_flags.
+     * mmu.c builds every later TCR value from it: EPD0 is ORed on here and in
+     * arch_mmu_context_switch() rather than stored, and the AS bit set below is
+     * how arch_mmu_init_aspace() learns whether user aspaces get their own ASID.
+     * The kernel mappings built above are global (nG clear, as in the
+     * MMU_PTE_KERNEL_* flags), which mmu.c relies on when it invalidates them
+     * with the all-ASID tlbi forms.
+     */
     /* inner sharable write-back write-allocate */
     movlit  tmp, MMU_TCR_FLAGS_BASE
 
@@ -284,6 +292,41 @@ FUNCTION(arm64_reset)
     mov     tmp2, #5
 1:
     orr     tmp, tmp, tmp2, lsl #32
+
+    /*
+     * Park if the cpu does not implement the granule this build is configured
+     * for (ID_AA64MMFR0_EL1.TGran4, TGran16, TGran64). An unimplemented size in
+     * TCR_EL1.TG0/TG1 makes the mmu use some other one, so the first fetch
+     * after it is enabled would fault into nothing and the cpu hang without a
+     * word. A debugger finds the pc at arm64_mmu_granule_unsupported.
+     */
+    mrs     tmp2, id_aa64mmfr0_el1
+#if PAGE_SIZE_SHIFT == SHIFT_64K
+    ubfx    tmp2, tmp2, #24, #4
+    cmp     tmp2, #0xf
+    b.eq    arm64_mmu_granule_unsupported
+#elif PAGE_SIZE_SHIFT == SHIFT_16K
+    ubfx    tmp2, tmp2, #20, #4
+    cbz     tmp2, arm64_mmu_granule_unsupported
+#else
+    ubfx    tmp2, tmp2, #28, #4
+    cmp     tmp2, #0xf
+    b.eq    arm64_mmu_granule_unsupported
+#endif
+
+#if !ARM64_ASID_FALLBACK
+    /*
+     * Set TCR_EL1.AS when the cpu implements 16 bit ASIDs (ID_AA64MMFR0_EL1.ASIDBits == 2).
+     * arch_mmu_init_aspace() reads the bit back from arm64_mmu_tcr_flags to decide
+     * whether user address spaces get their own ASID.
+     */
+    mrs     tmp2, id_aa64mmfr0_el1
+    ubfx    tmp2, tmp2, #4, #4
+    cmp     tmp2, #2
+    b.ne    2f
+    orr     tmp, tmp, #MMU_TCR_AS
+2:
+#endif
     adrp    tmp2, arm64_mmu_tcr_flags
     str     tmp, [tmp2, #:lo12:arm64_mmu_tcr_flags]
 
@@ -377,7 +420,14 @@ LOCAL_FUNCTION(arm64_enable_mmu)
     /* Initialize TCR_EL1 */
     /* set cacheable attributes on translation walk */
     /* (SMP extensions) non-shareable, inner write-back write-allocate */
+    /*
+     * TTBR0 walks stay disabled (EPD0) until arch_mmu_context_switch() loads a user
+     * address space, so a stray low address faults instead of walking whatever
+     * TTBR0 holds. This also makes the fetch that lands us in the trampoline
+     * below fault deterministically.
+     */
     ldr_global tmp, arm64_mmu_tcr_flags
+    orr     tmp, tmp, #MMU_TCR_EPD0
     msr     tcr_el1, tmp
 
     isb
@@ -423,6 +473,12 @@ LOCAL_FUNCTION(arm64_enable_mmu)
     ret
 END_FUNCTION(arm64_enable_mmu)
 
+/* the boot cpu parks here when it lacks the translation granule the build uses */
+FUNCTION(arm64_mmu_granule_unsupported)
+    wfe
+    b       arm64_mmu_granule_unsupported
+END_FUNCTION(arm64_mmu_granule_unsupported)
+
 .section .text.boot.vectab
 /*
  * The only type of exception that we expect with the trampoline VBAR active is
@@ -430,55 +486,46 @@ END_FUNCTION(arm64_enable_mmu)
  */
 LOCAL_FUNCTION(trampoline_vbar)
 .p2align 11
+
+.macro VBAR_HANG
+    wfe
+    b       .-4
+.endm
+
 .org 0x00
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x80
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x100
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x180
-    wfe
-    b       .-4
+    VBAR_HANG
     /* exception vector for synchronous exceptions from current EL -> current EL */
 .org 0x200
     adr_global tmp, .Lmmu_on_pc
     br      tmp
 .org 0x280
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x300
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x380
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x400
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x480
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x500
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x580
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x600
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x680
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x700
-    wfe
-    b       .-4
+    VBAR_HANG
 .org 0x780
-    wfe
-    b       .-4
+    VBAR_HANG
 END_FUNCTION(trampoline_vbar)
 #endif
 

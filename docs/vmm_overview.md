@@ -140,7 +140,7 @@ In LK, similar to many system, a process contains two separate virtual address s
 
 Address Space
 
-It's worth noting that, unlike some other kernels, the kernel space in LK doesn’t contains user space mapping. It means the kernel code can’t access user space memory directly.
+The kernel half of the address space is the same in every aspace, so kernel code runs the same regardless of which user aspace is loaded. Nothing stops the kernel from touching user addresses while a user aspace is active: none of the arches enable the protections that would (SMAP on x86, PAN on arm64, clearing SUM on riscv), which the arch tests rely on to read user pages directly.
 
 The ranges for both the kernel and user address spaces are defined at:
 
@@ -187,6 +187,133 @@ static void vm_init_postheap(uint level) {
 ```
 
 In the function vmm_reserve_space, LK creates a vmm_region, inserts it into region_list. More importantly, the function also updates the page table (pointed by tt_virt / tt_phys) to tell the processor that these pages are reserved.
+
+# Arch MMU contract
+
+`arch/include/arch/mmu.h` states one contract for `arch_mmu_map()`,
+`arch_mmu_unmap()`, `arch_mmu_query()` and `arch_mmu_protect()` that every MMU
+arch keeps. `arch_mmu_contract` in `arch/test/mmu_contract.cpp` checks it against
+what the page tables hold afterwards, in a user aspace where the arch has them
+and in a window of the kernel aspace everywhere. It does not read or write
+through its mappings, so it cannot see whether a protect reached the TLB. In
+short:
+
+- Permissions are granted, not taken away: READ is required, WRITE and EXECUTE
+  add to it. x86-32 and m68k have no NX, so a page there stays executable and
+  query reports EXECUTE; `arch_mmu_supports_nx_mappings()` says which.
+- Arguments are checked before anything else, a count of 0 included. A call
+  returns `NO_ERROR` or a negative error, never a count, and one that fails
+  leaves the mappings as they were.
+- map refuses a page that is already mapped with `ERR_ALREADY_EXISTS`, and a
+  page table allocation failure is `ERR_NO_MEMORY`; either way it takes back
+  what it had mapped.
+- unmap and protect skip holes, and refuse a range that covers part of a large
+  page, or an entry the arch keeps fixed, with `ERR_NOT_SUPPORTED` before
+  anything changes.
+- protect replaces the R/W/X permissions and nothing else, refuses EXECUTE on
+  uncached memory, and invalidates every page it changed, upgrades included.
+
+map makes a large page wherever vaddr, paddr and count line up: arm64 2MB and
+1GB blocks with 4K pages, 32MB with 16K and 512MB with 64K; riscv 2MB
+megapages, and 1GB gigapages under sv48; arm32 1MB sections. x86 and m68k map
+small pages only; x86's large pages are the physmap's, made at boot. Nothing
+splits a large page, which is why taking part of one is refused.
+
+# User address spaces
+
+Each thread carries the user aspace it runs in (`thread_t::aspace`, NULL for a
+kernel-only thread), and `vmm_set_active_aspace()` switches the current thread
+to another one. When the scheduler switches between threads with different
+aspaces it calls `vmm_context_switch(old, new)`, which hands both ends of the
+switch to `arch_mmu_context_switch(old, new)`; `new == NULL` loads the
+kernel-only state. On arm64 that means TTBR0 walks are disabled (TCR_EL1.EPD0),
+which is also how every cpu boots, so a stray low address faults rather than
+walking whatever TTBR0 holds. On riscv the kernel root table is loaded, whose
+user half is empty.
+
+## Paging mode on riscv
+
+A riscv build picks its paging mode with `RISCV_MMU`, `sv39` or `sv48`, set by
+the platform and overridable on the make command line. The mode fixes the table
+depth, the aspace bases and sizes, and the physmap the boot code writes at the
+bottom of the kernel half: 64 gigapages of 1GB under sv39, one 512GB terapage
+under sv48. It is compiled in rather than probed; `start.S` reads satp back after
+setting it and parks a hart at `riscv_mmu_mode_unsupported` if the cpu refused
+the mode. `qemu-virt-riscv` and the HiFive Premier P550 run sv48; the other
+boards use sv39. The kernel half of every root table is the same: the kernel's
+top level entries are written once at boot (the physmap, and a static second
+level table behind every other kernel entry) and copied into each user root as
+it is created, so `arch_mmu_map`, `arch_mmu_unmap` and `arch_mmu_protect` never
+write a top level entry of the kernel aspace, and an unmap or protect that would
+touch the physmap is refused.
+
+## ASIDs
+
+The arm64 and riscv ports tag user TLB entries with an address space identifier
+so they survive a context switch. Both use the allocator in `kernel/vm/asid.c`:
+the kernel is `ASID_KERNEL` (1), user aspaces are handed ids from 2 up, and an
+aspace gives its id back when destroyed, after its entries have been flushed on
+every cpu. The id is only used when the cpu implements the full width, 16 bits
+on either arch (arm64 reports it in `ID_AA64MMFR0_EL1.ASIDBits` and enables it
+with `TCR_EL1.AS`; riscv is probed by writing satp). Otherwise every user aspace
+shares one id and each switch to a different user aspace flushes that id on the
+local cpu. `ARM64_ASID_FALLBACK=1` and `RISCV_ASID_FALLBACK=1` force the shared
+path for testing, since qemu always implements 16 bits.
+
+Kernel mappings are global on both arches (nG clear on arm64, the G bit on
+riscv), so they match under any id and are invalidated with the all-asid forms;
+user descriptors are marked non-global on arm64 so they are actually tagged.
+
+## TLB maintenance
+
+Every change to a translation table is made visible to the table walkers
+before the invalidate that depends on it, and the invalidate is complete on
+every cpu before anything relies on the old translation being gone: freeing a
+page table, reusing an asid, or returning to the caller. On arm64 that is `dsb
+ishst`, a broadcast `tlbi ...is`, then `dsb ish`, with an `isb` for kernel
+mappings. riscv has no broadcast invalidate, so `sfence.vma` runs on every cpu
+that translates through the kernel's tables, through `mp_sync_exec_cpus()`,
+which requires interrupts to be enabled when other cpus are up. That set is not
+the scheduler's active cpus: a secondary joins it just before it switches from
+the boot trampoline to the kernel's tables, well before it is active, and a
+shootdown in between waits until the secondary first enables interrupts.
+riscv also fences after a map, since a cpu may cache a translation for a page
+that was invalid when it last looked, unless the cpu advertises Svvptc, which
+rules that out. Either way a page fault that the tables do not explain is taken
+as such a stale translation: the hart flushes its TLB and retries the access,
+and one that keeps recurring is reported as a real fault. Intermediate tables
+emptied by an unmap are unlinked and freed only after the shootdown.
+`arch_mmu_protect()` invalidates every page whose entry it changed, a permission
+added as much as one taken away, since a cpu may still hold the old entry.
+
+The other arches follow the same order. arm32 broadcasts its invalidates on SMP
+and flushes a cpu's user entries on every switch between user aspaces, which all
+run with ASID 0; x86 shoots down through `mp_sync_exec()`, also with interrupts
+enabled; m68k flushes its ATC with `pflusha` after a map as well, since the
+68040 caches a walk that ended at an invalid descriptor.
+
+`arch_mmu_destroy_aspace()` expects every mapping to be gone already, which is
+what frees the lower tables, and no cpu to have the aspace loaded.
+`vmm_free_aspace()` switches the current thread off the aspace first and fails
+with `ERR_BUSY` while another cpu still has it loaded; the arch keeps that
+count in `arch_mmu_context_switch()` and reports it through
+`arch_aspace_active_cpus()`.
+
+## Running in user mode
+
+`arch_enter_uspace(entry, stack_top)` drops the current thread into user mode
+in its active aspace; it never returns. Exceptions taken from user space reach
+the kernel through weak hooks the arch provides: `arm64_syscall()` and
+`arm64_user_exception()`, `riscv_syscall_handler()` and
+`riscv_user_exception()`. The defaults print the frame and end the thread with
+`thread_exit()` rather than panicking, and an override that wants the same
+fallback can call the `*_unhandled()` variants. On arm64 the kernel keeps its
+percpu pointer in x18, which user space may overwrite, so the vectors for
+exceptions from EL0 reload it from a slot at the top of the thread's kernel
+stack that `arch_enter_uspace()` fills and every return to EL0 refreshes.
+`arch_uspace_tests` in `arch/test/` runs a stub through a syscall and a fault
+this way on both arches, and a store and a jump into a page before and after
+`arch_mmu_protect()` changes it.
 
 # Physical to virtual mapping
 

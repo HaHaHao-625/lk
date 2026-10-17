@@ -30,6 +30,12 @@ RISCV_EXTENSION_LIST ?=
 ARCH_RISCV_EMBEDDED ?= false
 ARCH_RISCV_TWOSEGMENT ?= false
 
+# Set to 1 to run every user address space on asid 0 with a flush per switch,
+# the way a cpu without a full 16 bit asid field is handled, even when the cpu
+# has one. Only useful for testing that path; qemu implements all 16 bits.
+RISCV_ASID_FALLBACK ?= 0
+GLOBAL_DEFINES += RISCV_ASID_FALLBACK=$(RISCV_ASID_FALLBACK)
+
 GLOBAL_DEFINES += SMP_MAX_CPUS=$(SMP_MAX_CPUS)
 GLOBAL_DEFINES += PLATFORM_HAS_DYNAMIC_TIMER=1
 
@@ -183,17 +189,29 @@ else
     $(error SUBARCH not set or set to something unknown)
 endif
 
+# Rust target spec, one per (bit width, float ABI) so it matches ARCH_COMPILEFLAGS above.
+# The specs live in arch/riscv/riscv{32,64}[-fpu]-llvm.json and RUST_TARGET must equal the
+# json basename (see lib/rust_support/rules.mk). Only consumed when a project pulls in
+# lib/rust_support via USE_RUST=1; a platform can override with its own spec.
+ifeq (true,$(call TOBOOL,$(RISCV_FPU)))
+    RUST_TARGET ?= riscv$(SUBARCH)-fpu-llvm
+else
+    RUST_TARGET ?= riscv$(SUBARCH)-llvm
+endif
+RUST_TARGET_PATH ?= $(abspath $(LKROOT))/arch/riscv/$(RUST_TARGET).json
+
+# mirror the optional -march extensions into rustc's target feature list
+ifneq ($(RISCV_EXTENSION_LIST),)
+    RUST_CFLAGS += -Ctarget-feature=$(subst $(SPACE),$(COMMA),$(addprefix +,$(RISCV_EXTENSION_LIST)))
+endif
+
 # test to see if -misa-spec=2.2 is a valid switch.
 # misa-spec is added to make sure the compiler picks up the zicsr extension by default.
-# If CC is being overridden by the user, use that instead of the toolchain gcc.
-ifdef CC
-MISA_SPEC := $(shell $(CC) $(ARCH_COMPILEFLAGS) -misa-spec=2.2 -E - < /dev/null > /dev/null 2>&1 && echo supported)
-else
+ifneq ($(TOOLCHAIN),clang)
 MISA_SPEC := $(shell $(TOOLCHAIN_PREFIX)gcc $(ARCH_COMPILEFLAGS) -misa-spec=2.2 -E - < /dev/null > /dev/null 2>&1 && echo supported)
-endif
-$(info MISA_SPEC = $(MISA_SPEC))
 ifeq ($(MISA_SPEC),supported)
 ARCH_COMPILEFLAGS += -misa-spec=2.2
+endif
 endif
 
 # embedded switch sets the default compile optimization and passes
@@ -207,8 +225,7 @@ ARCH_OPTFLAGS ?= -O2
 WITH_LINKER_GC ?= 0
 endif
 
-LIBGCC := $(shell $(TOOLCHAIN_PREFIX)gcc $(GLOBAL_COMPILEFLAGS) $(ARCH_COMPILEFLAGS) $(GLOBAL_CFLAGS) -print-libgcc-file-name)
-$(info LIBGCC = $(LIBGCC))
+CLANG_ARCH_TRIPLE ?= riscv$(SUBARCH)-unknown-elf
 
 # potentially generated files that should be cleaned out with clean make rule
 GENERATED += \

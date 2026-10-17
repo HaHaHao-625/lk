@@ -16,8 +16,15 @@ ifndef LKROOT
 $(error please define LKROOT to the root of the lk build system)
 endif
 
-# any local environment overrides can optionally be placed in local.mk
+# any local environment overrides can optionally be placed in local.mk.
+# Set IGNORE_LOCAL_MK=1 to skip it, so that a build depends only on the
+# arguments it was given. Useful when reproducing a CI result or bisecting a
+# build break, where a silently included local.mk is easy to overlook. Note
+# local.mk is also where a toolchain prefix may be set, so a build that relies
+# on one will need it passed explicitly instead.
+ifneq ($(IGNORE_LOCAL_MK),1)
 -include local.mk
+endif
 
 # If one of our goals (from the commandline) happens to have a
 # matching project/goal.mk, then we should re-invoke make with
@@ -70,7 +77,12 @@ GLOBAL_COMPILEFLAGS += -fno-common
 # rely on all hosted environment functionality being present.
 GLOBAL_COMPILEFLAGS += -ffreestanding
 GLOBAL_CFLAGS := --std=gnu11 -Werror-implicit-function-declaration -Wstrict-prototypes -Wwrite-strings
-GLOBAL_CPPFLAGS := --std=c++14 -fno-exceptions -fno-rtti -fno-threadsafe-statics
+# -nostdinc++ keeps the toolchain's own C++ standard library headers out of
+# the include path; the kernel provides its own freestanding subset in
+# lib/libcpp. An accidental #include <vector> should fail loudly instead of
+# silently picking up whatever hosted headers sit next to the cross compiler.
+GLOBAL_CPPFLAGS := --std=c++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics -Wno-mismatched-tags
+GLOBAL_CPPFLAGS += -nostdinc++
 GLOBAL_ASMFLAGS := -DASSEMBLY
 GLOBAL_LDFLAGS :=
 
@@ -132,6 +144,10 @@ GENERATED := $(CONFIGHEADER)
 # anything added to GLOBAL_DEFINES will be put into $(BUILDDIR)/config.h
 GLOBAL_DEFINES := LK=1
 
+# Always defined, so code can test it with a bare #if UBSAN. Instrumentation
+# inflates stack frames noticeably, which the tighter embedded configs care about.
+GLOBAL_DEFINES += UBSAN=$(if $(filter 1,$(UBSAN)),1,0)
+
 # Anything added to GLOBAL_SRCDEPS will become a dependency of every source file in the system.
 # Useful for header files that may be included by one or more source files.
 GLOBAL_SRCDEPS := $(CONFIGHEADER)
@@ -177,6 +193,10 @@ DENY_MODULES :=
 # Build modules with unit tests enabled
 WITH_TESTS ?= false
 
+# Set to 1 by platform/target rules.mk for targets with RAM well under ~1MB, so
+# memory-hungry code (tests, etc) can size itself down or compile itself out.
+LK_EMBEDDED ?= 0
+
 # try to include the project file
 -include project/$(PROJECT).mk
 ifndef TARGET
@@ -193,8 +213,11 @@ $(error couldn't find arch or platform doesn't define arch)
 endif
 
 # list the architecture specified in the project/target/platform rules.mk and early terminate.
+# SUBARCH is only meaningful for some arches (riscv's 32/64, arm's arm/arm-m) and may be
+# empty; the arch rules.mk has not been included yet so arch level defaults do not apply.
 ifeq ($(MAKECMDGOALS), list-arch)
 $(info ARCH = $(ARCH))
+$(info SUBARCH = $(SUBARCH))
 .PHONY: list-arch
 list-arch:
 else
@@ -216,38 +239,129 @@ else
 
 # default to no ccache
 CCACHE ?=
-CC ?= $(CCACHE) $(TOOLCHAIN_PREFIX)gcc
-LD ?= $(TOOLCHAIN_PREFIX)ld
-OBJDUMP ?= $(TOOLCHAIN_PREFIX)objdump
-OBJCOPY ?= $(TOOLCHAIN_PREFIX)objcopy
-CPPFILT ?= $(TOOLCHAIN_PREFIX)c++filt
-SIZE ?= $(TOOLCHAIN_PREFIX)size
-NM ?= $(TOOLCHAIN_PREFIX)nm
-STRIP ?= $(TOOLCHAIN_PREFIX)strip
 
-# Detect whether we are using ld.lld. If we don't detect ld.lld, we assume
-# it's ld.bfd. This check can be refined in the future if we need to handle
-# more cases (e.g. ld.gold).
-LINKER_TYPE := $(shell $(LD) -v 2>&1 | grep -q "LLD" && echo lld || echo bfd)
+TOOLCHAIN ?= gcc
+
+ifeq ($(TOOLCHAIN),clang)
+    # The clang on PATH and the tools installed beside it, or failing that the newest
+    # /usr/lib/llvm-N; mixing releases breaks LTO (see the LTO_MODE check below).
+    ifndef CLANG_BINDIR
+        CLANG_BINDIR := $(patsubst %/,%,$(dir $(realpath $(shell which clang 2>/dev/null))))
+        ifeq ($(CLANG_BINDIR),)
+            CLANG_BINDIR := $(lastword $(shell ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V))
+        endif
+    endif
+    CLANG_PATH := $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/clang),$(shell which clang 2>/dev/null))
+    CLANG_CC := $(if $(CLANG_PATH),$(CLANG_PATH),clang)
+    CLANG_TARGET ?= $(CLANG_ARCH_TRIPLE)
+    CC ?= $(CCACHE) $(CLANG_CC) --target=$(CLANG_TARGET)
+
+    # DWARF 4 for compatibility with GNU binutils
+    GLOBAL_COMPILEFLAGS += -gdwarf-4
+
+    LLD_PATH := $(firstword $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/ld.lld)) $(shell which ld.lld 2>/dev/null))
+    ifeq ($(LD),ld.lld)
+        ifeq ($(LLD_PATH),)
+            $(error ld.lld linker requested but not found. Please install lld package or set CLANG_BINDIR)
+        endif
+        override LD := $(LLD_PATH)
+    else
+        LD ?= $(if $(LLD_PATH),$(LLD_PATH),$(TOOLCHAIN_PREFIX)ld)
+    endif
+
+    OBJDUMP_PATH := $(firstword $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/llvm-objdump)) $(shell which llvm-objdump 2>/dev/null))
+    OBJDUMP ?= $(if $(OBJDUMP_PATH),$(OBJDUMP_PATH),$(TOOLCHAIN_PREFIX)objdump)
+
+    OBJCOPY_PATH := $(firstword $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/llvm-objcopy)) $(shell which llvm-objcopy 2>/dev/null))
+    OBJCOPY ?= $(if $(OBJCOPY_PATH),$(OBJCOPY_PATH),$(TOOLCHAIN_PREFIX)objcopy)
+
+    CPPFILT_PATH := $(firstword $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/llvm-cxxfilt)) $(shell which llvm-cxxfilt 2>/dev/null))
+    CPPFILT ?= $(if $(CPPFILT_PATH),$(CPPFILT_PATH),$(TOOLCHAIN_PREFIX)c++filt)
+
+    SIZE_PATH := $(firstword $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/llvm-size)) $(shell which llvm-size 2>/dev/null))
+    SIZE ?= $(if $(SIZE_PATH),$(SIZE_PATH),$(TOOLCHAIN_PREFIX)size)
+
+    NM_PATH := $(firstword $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/llvm-nm)) $(shell which llvm-nm 2>/dev/null))
+    NM ?= $(if $(NM_PATH),$(NM_PATH),$(TOOLCHAIN_PREFIX)nm)
+
+    STRIP_PATH := $(firstword $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/llvm-strip)) $(shell which llvm-strip 2>/dev/null))
+    STRIP ?= $(if $(STRIP_PATH),$(STRIP_PATH),$(TOOLCHAIN_PREFIX)strip)
+else
+    CC ?= $(CCACHE) $(TOOLCHAIN_PREFIX)gcc
+    LD ?= $(TOOLCHAIN_PREFIX)ld
+    OBJDUMP ?= $(TOOLCHAIN_PREFIX)objdump
+    OBJCOPY ?= $(TOOLCHAIN_PREFIX)objcopy
+    CPPFILT ?= $(TOOLCHAIN_PREFIX)c++filt
+    SIZE ?= $(TOOLCHAIN_PREFIX)size
+    NM ?= $(TOOLCHAIN_PREFIX)nm
+    STRIP ?= $(TOOLCHAIN_PREFIX)strip
+endif
+
+# Detect whether we are using ld.lld, assuming it is named ld.lld. If we don't
+# detect ld.lld, we assume it's ld.bfd. This check can be refined in the future
+# if we need to handle more cases (e.g. ld.gold).
+#
+# Match on the name rather than the version banner. An 'ld' that is really lld
+# reports "LLD" and would be taken for a usable cross linker even when it is
+# the Mach-O only flavor, as on macOS, enabling flags and code paths that then
+# fail confusingly. LLD is only wanted here when it has been asked for by name
+# (LD=ld.lld), so that is what we look for.
+LINKER_TYPE := $(if $(filter %ld.lld,$(notdir $(firstword $(LD)))),lld,bfd)
 $(info LINKER_TYPE=$(LINKER_TYPE))
 # Detect whether we are compiling with GCC or Clang
 COMPILER_TYPE := $(shell $(CC) -v 2>&1 | grep -q "clang version" && echo clang || echo gcc)
 $(info COMPILER_TYPE=$(COMPILER_TYPE))
+
+# Find libgcc.a (or equivalent) for this compiler/multilib combination.
+# This must happen here, now that CC/TOOLCHAIN are fully resolved above --
+# under TOOLCHAIN=clang this lets Clang report its own runtime library for
+# targets where it has one; otherwise fall back to querying a matching
+# cross GCC. (arch/*/rules.mk, included earlier, sets ARCH_COMPILEFLAGS and
+# friends used below to select the right multilib variant.)
+LIBGCC ?= $(shell $(CC) $(GLOBAL_COMPILEFLAGS) $(ARCH_COMPILEFLAGS) $(ARCH_COMPILEFLAGS_FLOAT) $(THUMBCFLAGS) $(GLOBAL_CFLAGS) -print-libgcc-file-name 2>/dev/null)
+ifeq ($(wildcard $(LIBGCC)),)
+LIBGCC := $(shell $(TOOLCHAIN_PREFIX)gcc $(GLOBAL_COMPILEFLAGS) $(ARCH_COMPILEFLAGS) $(ARCH_COMPILEFLAGS_FLOAT) $(THUMBCFLAGS) $(GLOBAL_CFLAGS) -print-libgcc-file-name 2>/dev/null)
+endif
+# Freeze the result: without this, LIBGCC (set via ?=, a recursively-expanded
+# variable) would re-run the shell command above on every later reference,
+# against whatever GLOBAL_COMPILEFLAGS/ARCH_COMPILEFLAGS happen to look like
+# at that point (more warning/ABI flags are appended below), which is both
+# wasteful and fragile.
+LIBGCC := $(strip $(LIBGCC))
+
+# Optional link-time optimization: off, thin, or full.
+# thin is Clang/lld-only (ThinLTO); GCC has no equivalent mode yet.
+LTO_MODE ?= off
+GLOBAL_LTO_COMPILEFLAGS :=
+ifneq ($(LTO_MODE),off)
+ifeq ($(COMPILER_TYPE),clang)
+ifneq ($(LINKER_TYPE),lld)
+$(error LTO_MODE=$(LTO_MODE) with TOOLCHAIN=clang requires ld.lld, which has native LTO support; got LD=$(LD))
+endif
+# LTO code generation runs inside ld.lld, which must come from the same LLVM release as the
+# compiler: a newer one can read an older clang's target features differently (LLVM 21 drops
+# M from clang 18's "+m,...,-zmmul") and quietly emit libcalls for every multiply and divide.
+CLANG_MAJOR := $(firstword $(subst ., ,$(shell $(CC) -dumpversion)))
+LLD_MAJOR := $(shell $(LD) --version | sed -n 's/.*LLD \([0-9][0-9]*\)\..*/\1/p')
+ifneq ($(CLANG_MAJOR),$(LLD_MAJOR))
+$(error LTO_MODE=$(LTO_MODE) needs clang and ld.lld from the same LLVM release; got clang $(CLANG_MAJOR) and ld.lld $(LLD_MAJOR) ($(LD)), set CLANG_BINDIR)
+endif
+GLOBAL_LTO_COMPILEFLAGS += -flto=$(LTO_MODE)
+else
+$(error LTO_MODE=$(LTO_MODE) is not yet supported for COMPILER_TYPE=$(COMPILER_TYPE))
+endif
+endif
 
 # Now that CC is defined we can check if warning flags are supported and add
 # them to GLOBAL_COMPILEFLAGS if they are.
 ifeq ($(call is_warning_flag_supported,-Wnonnull-compare),yes)
 GLOBAL_COMPILEFLAGS += -Wno-nonnull-compare
 endif
-# Ideally we would move this check to arm64/rules.mk, but we can only check
-# for supported warning flags once CC is defined.
-ifeq ($(ARCH),arm64)
-# Clang incorrectly diagnoses msr operations as need a 64-bit operand even if
-# the underlying register is actually 32 bits. Silence this common warning.
-ifeq ($(call is_warning_flag_supported,-Wasm-operand-widths),yes)
-ARCH_COMPILEFLAGS += -Wno-asm-operand-widths
-endif
-endif
+# Note: -Wno-asm-operand-widths used to be added for arm64 here, on the premise
+# that clang was wrong to want a 64-bit operand for msr. It is not wrong: MSR/MRS
+# transfer all 64 bits and only accept an X register, so a 32-bit operand emits
+# an x register whose upper half was never zeroed. ARM64_WRITE_SYSREG casts to
+# uint64_t instead, which fixes the cause rather than hiding it.
 
 ifeq ($(ARCH),riscv)
 # ld.lld does not support linker relaxations yet.
@@ -293,6 +407,7 @@ GLOBAL_DEFINES += \
 	PLATFORM=\"$(PLATFORM)\" \
 	ARCH_$(ARCH)=1 \
 	ARCH=\"$(ARCH)\" \
+	LK_EMBEDDED=$(LK_EMBEDDED) \
 	$(addsuffix =1,$(addprefix WITH_,$(ALLMODULES)))
 
 # debug build?
@@ -341,7 +456,11 @@ GLOBAL_DEFINES += ARCH_CFLAGS=\"$(subst $(SPACE),_,$(ARCH_CFLAGS))\"
 GLOBAL_DEFINES += ARCH_CPPFLAGS=\"$(subst $(SPACE),_,$(ARCH_CPPFLAGS))\"
 GLOBAL_DEFINES += ARCH_ASMFLAGS=\"$(subst $(SPACE),_,$(ARCH_ASMFLAGS))\"
 GLOBAL_DEFINES += ARCH_LDFLAGS=\"$(subst $(SPACE),_,$(ARCH_LDFLAGS))\"
+GLOBAL_DEFINES += LTO_MODE=\"$(LTO_MODE)\"
+GLOBAL_DEFINES += GLOBAL_LTO_COMPILEFLAGS=\"$(subst $(SPACE),_,$(GLOBAL_LTO_COMPILEFLAGS))\"
 GLOBAL_DEFINES += TOOLCHAIN_PREFIX=\"$(subst $(SPACE),_,$(TOOLCHAIN_PREFIX))\"
+GLOBAL_DEFINES += TOOLCHAIN=\"$(subst $(SPACE),_,$(TOOLCHAIN))\"
+GLOBAL_DEFINES += LD=\"$(subst $(SPACE),_,$(LD))\"
 GLOBAL_DEFINES += LIBGCC=\"$(subst $(SPACE),_,$(LIBGCC))\"
 
 ifneq ($(OBJS),)

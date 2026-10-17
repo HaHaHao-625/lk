@@ -12,8 +12,8 @@ MODULE_SRCS += $(LOCAL_DIR)/port.cpp
 
 MODULE_DEPS += dev/bus/pci
 MODULE_DEPS += lib/bio
-
-MODULE_CPPFLAGS += -Wno-invalid-offsetof
+MODULE_DEPS += lib/libcpp
+MODULE_DEPS += lib/lktl
 
 include make/module.mk
 

@@ -15,6 +15,9 @@
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
+#include <memory>
+#include <new>
 #include <stdio.h>
 #include <string.h>
 
@@ -22,8 +25,7 @@
 
 namespace {
 
-// constexpr IRC_SERVER = IPV4(176,58,122,119) // irc.libera.chat
-constexpr ipv4_addr_t IRC_SERVER = IPV4(88, 99, 244, 4); // irc.sortix.org
+constexpr const char *IRC_SERVER = "irc.sortix.org";
 constexpr uint16_t IRC_PORT = 6667;
 constexpr const char *IRC_USER = "geist";
 constexpr const char *IRC_NICK = "geist-lk";
@@ -42,6 +44,7 @@ class irc_client {
     status_t console_input_line(const char *line, bool &exit);
 
     void set_server(uint32_t server) { server_ip_ = server; }
+    void set_server_name(const char *name) { server_name_ = name; }
     void set_server_port(uint16_t port) { server_port_ = port; }
 
   private:
@@ -51,6 +54,7 @@ class irc_client {
     tcp_socket_t *sock_ = nullptr;
 
     uint32_t server_ip_ = 0;
+    const char *server_name_ = nullptr;
     uint16_t server_port_ = 0;
     enum class state : uint8_t {
         INITIAL,
@@ -96,6 +100,16 @@ void irc_client::handle_ctcp_request(const char *nick, const char *ctcp_cmd) {
 
 status_t irc_client::connect() {
     AutoLock al(&lock_);
+
+    if (server_ip_ == 0 && server_name_) {
+        // a name, a dotted quad, whichever was configured
+        auto err = minip_resolve(server_name_, &server_ip_);
+        if (err < 0) {
+            printf("err %d resolving '%s'\n", err, server_name_);
+            return err;
+        }
+        printf("irc: %s is %u.%u.%u.%u\n", server_name_, IPV4_SPLIT(server_ip_));
+    }
 
     if (server_ip_ == 0 || server_port_ == 0) {
         return ERR_NOT_CONFIGURED;
@@ -273,21 +287,21 @@ status_t irc_client::handshake() {
     snprintf(buf, sizeof(buf), "USER %s host server :geist\r\n", IRC_USER);
     auto err = tcp_write(sock_, buf, strlen(buf));
     if (err < 0) {
-        printf("error %ld writing to server\n", err);
+        printf("error %zd writing to server\n", err);
         return static_cast<status_t>(err);
     }
 
     snprintf(buf, sizeof(buf), "NICK %s\r\n", IRC_NICK);
     err = tcp_write(sock_, buf, strlen(buf));
     if (err < 0) {
-        printf("error %ld writing to server\n", err);
+        printf("error %zd writing to server\n", err);
         return static_cast<status_t>(err);
     }
 
     snprintf(buf, sizeof(buf), "JOIN %s\r\n", IRC_CHAN);
     err = tcp_write(sock_, buf, strlen(buf));
     if (err < 0) {
-        printf("error %ld writing to server\n", err);
+        printf("error %zd writing to server\n", err);
         return static_cast<status_t>(err);
     }
 
@@ -358,7 +372,7 @@ void irc_app_entry(const struct app_descriptor *app, void *args) {
     printf("welcome to IRC!\n");
 
     // create a local state object
-    irc_client *irc = new irc_client();
+    std::unique_ptr<irc_client> irc(new (std::nothrow) irc_client());
     if (!irc) {
         return;
     }
@@ -367,15 +381,15 @@ void irc_app_entry(const struct app_descriptor *app, void *args) {
 
     irc->init();
 
-    // clean up and delete the object on the way out
+    // shut down on the way out. Declared after the client so it runs first:
+    // the unique_ptr deletes the object once this has returned.
     auto ac = lk::make_auto_call([&irc]() {
         printf("cleaning up IRC\n");
         irc->shutdown();
-        delete irc;
     });
 
     // configure the parameters
-    irc->set_server(IRC_SERVER);
+    irc->set_server_name(IRC_SERVER);
     irc->set_server_port(IRC_PORT);
 
     err = irc->connect();
@@ -392,7 +406,7 @@ void irc_app_entry(const struct app_descriptor *app, void *args) {
     thread_t *console_thread;
     thread_t *server_thread;
 
-    console_thread = thread_create("irc console", console_thread_worker, irc, DEFAULT_PRIORITY,
+    console_thread = thread_create("irc console", console_thread_worker, irc.get(), DEFAULT_PRIORITY,
                                    DEFAULT_STACK_SIZE);
     thread_resume(console_thread);
 
@@ -404,7 +418,7 @@ void irc_app_entry(const struct app_descriptor *app, void *args) {
 
         return 0;
     };
-    server_thread = thread_create("irc socket", server_thread_worker, irc, DEFAULT_PRIORITY,
+    server_thread = thread_create("irc socket", server_thread_worker, irc.get(), DEFAULT_PRIORITY,
                                   DEFAULT_STACK_SIZE);
     thread_resume(server_thread);
 

@@ -40,7 +40,7 @@ struct sysparam_phys {
     //uint8_t data[data];
     // 0 padding to next multiple of 4
 
-    uint8_t namedata[0];
+    uint8_t namedata[];
 };
 
 /* a copy we keep in memory */
@@ -615,7 +615,7 @@ usage:
         err = sysparam_write();
     } else if (!strcmp(argv[1].str, "nuke")) {
         ssize_t err_len = bio_erase(params.bdev, params.offset, params.len);
-        printf("erase returns %ld\n", err_len);
+        printf("erase returns %zd\n", err_len);
 #endif // SYSPARAM_ALLOW_WRITE
     } else if (!strcmp(argv[1].str, "length")) {
         if (argc < 3) goto notenoughargs;

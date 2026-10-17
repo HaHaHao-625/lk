@@ -36,6 +36,11 @@
 
 #define LINE_LEN 128
 
+// Upper bound on the length of a single line of input, used when a script is passed
+// in wholesale via console_run_script(). Also the size of the buffer the tokenizer
+// writes the split up tokens into, which keeps the two in sync.
+#define MAX_LINE_LEN 1024
+
 #define PANIC_LINE_LEN 32
 
 #define MAX_NUM_ARGS 16
@@ -77,8 +82,8 @@ static void dump_history(console_t *con);
 /* a linear array of statically defined command blocks,
    defined in the linker script.
  */
-extern const console_cmd_block __start_commands __WEAK;
-extern const console_cmd_block __stop_commands __WEAK;
+extern const console_cmd_block __start_commands[] __WEAK;
+extern const console_cmd_block __stop_commands[] __WEAK;
 
 static int cmd_help(int argc, const console_cmd_args *argv);
 static int cmd_help_panic(int argc, const console_cmd_args *argv);
@@ -242,7 +247,7 @@ usage:
 #endif  // CONSOLE_ENABLE_REPEAT
 
 static const console_cmd *match_command(const char *command, const uint8_t availability_mask) {
-    for (const console_cmd_block *block = &__start_commands; block != &__stop_commands; block++) {
+    for (const console_cmd_block *block = __start_commands; block != __stop_commands; block++) {
         const console_cmd *curr_cmd = block->list;
         for (size_t i = 0; i < block->count; i++) {
             if ((availability_mask & curr_cmd[i].availability_mask) == 0) {
@@ -418,6 +423,14 @@ static int tokenize_command(const char *inbuffer, const char **continuebuffer, c
 
 //      dprintf(SPEW, "c 0x%hhx state %d arg %d inpos %d pos %d\n", c, state, arg, inpos, outpos);
 
+        // A single pass through the state machine writes at most two bytes, and the
+        // terminator below needs one more. Bail out instead of running off the end of
+        // the output buffer.
+        if (unlikely(outpos + 3 > (int)buflen)) {
+            dprintf(INFO, "console: command too long, discarding\n");
+            return -1;
+        }
+
         switch (state) {
             case INITIAL:
             case NEXT_FIELD:
@@ -538,6 +551,10 @@ static int tokenize_command(const char *inbuffer, const char **continuebuffer, c
 
                     state = NEXT_FIELD;
                 } else {
+                    if (unlikely(varnamepos + 1 >= (int)sizeof(varname))) {
+                        dprintf(INFO, "console: variable name too long, discarding command\n");
+                        return -1;
+                    }
                     varname[varnamepos] = c;
                     varnamepos++;
                     inpos++;
@@ -606,12 +623,12 @@ static status_t command_loop(console_t *con, int (*get_line)(const char **, void
     const char *continuebuffer;
     char *outbuf = NULL;
 
-    args = (console_cmd_args *) malloc (MAX_NUM_ARGS * sizeof(console_cmd_args));
+    args = malloc (MAX_NUM_ARGS * sizeof(console_cmd_args));
     if (unlikely(args == NULL)) {
         goto no_mem_error;
     }
 
-    const size_t outbuflen = 1024;
+    const size_t outbuflen = MAX_LINE_LEN;
     outbuf = malloc(outbuflen);
     if (unlikely(outbuf == NULL)) {
         goto no_mem_error;
@@ -668,10 +685,10 @@ static status_t command_loop(console_t *con, int (*get_line)(const char **, void
         con->abort_script = false;
         if (strcmp(args[argc - 1].str, "&") == 0) { // background execution
             background_cmd_args *bg_args =
-                (background_cmd_args *)malloc(sizeof(background_cmd_args));
+                malloc(sizeof(background_cmd_args));
             bg_args->command = command;
             bg_args->argc = argc - 1;
-            bg_args->args = (console_cmd_args *)malloc(argc * sizeof(console_cmd_args));
+            bg_args->args = malloc(argc * sizeof(console_cmd_args));
             for (int i = 0; i < argc; i++) {
                 memcpy(&bg_args->args[i], &args[i], sizeof(console_cmd_args));
                 bg_args->args[i].str = strdup(args[i].str);
@@ -792,10 +809,24 @@ static int fetch_next_line(const char **buffer, void *cookie) {
 static int console_run_script_etc(console_t *con, const char *string, bool locked) {
     struct line_read_struct lineread;
 
+    // Size the line buffer off the script itself so that fetch_next_line() doesn't
+    // silently split a long line in the middle of a token. Clamp it to the size of the
+    // buffer the tokenizer will be writing into.
+    size_t buflen = strlen(string) + 1;
+    if (buflen < LINE_LEN) {
+        buflen = LINE_LEN;
+    } else if (buflen > MAX_LINE_LEN) {
+        buflen = MAX_LINE_LEN;
+    }
+
     lineread.string = string;
     lineread.pos = 0;
-    lineread.buffer = malloc(LINE_LEN);
-    lineread.buflen = LINE_LEN;
+    lineread.buffer = malloc(buflen);
+    if (!lineread.buffer) {
+        dprintf(INFO, "%s: not enough memory\n", __func__);
+        return ERR_NO_MEMORY;
+    }
+    lineread.buflen = buflen;
 
     command_loop(con, &fetch_next_line, (void *)&lineread, false, locked);
 
@@ -838,13 +869,13 @@ static int cmd_help_impl(uint8_t availability_mask) {
 
     // If we're not panicking and are free to allocate memory, sort the commands
     // alphabetically before printing.
-    const console_cmd_block *start = &__start_commands;
-    const console_cmd_block *end = &__stop_commands;
+    const console_cmd_block *start = __start_commands;
+    const console_cmd_block *end = __stop_commands;
     console_cmd_block *sorted = NULL;
     if ((availability_mask & CMD_AVAIL_PANIC) == 0) {
         size_t num_cmds = end - start;
         size_t size_bytes = num_cmds * sizeof(console_cmd_block);
-        sorted = (console_cmd_block *) malloc(size_bytes);
+        sorted = malloc(size_bytes);
         if (sorted) {
             memcpy(sorted, start, size_bytes);
             qsort(sorted, num_cmds, sizeof(console_cmd_block), compare_cmds);

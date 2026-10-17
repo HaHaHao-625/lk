@@ -23,6 +23,8 @@ else
 MODULE_DEPS += kernel/novm
 endif
 
-MODULE_OPTIONS := extra_warnings
+MODULE_OPTIONS := extra_warnings test
+
+MODULE_WEAK_DEPS += lib/evlog lib/backtrace
 
 include make/module.mk

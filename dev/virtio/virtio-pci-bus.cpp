@@ -10,6 +10,7 @@
 
 #include <dev/virtio/virtio-pci-bus.h>
 
+#include <memory>
 #include <stdlib.h>
 #include <dev/virtio.h>
 #include <dev/virtio/virtio-device.h>
@@ -147,19 +148,41 @@ void virtio_pci_bus::virtio_reset_device() {
 
 void virtio_pci_bus::virtio_status_acknowledge_driver() {
     common_config()->device_status |= VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
+
+    if (!legacy_) {
+        // Modern virtio requires VERSION_1 (feature bit 32). Drivers reset the device on entry,
+        // which drops whatever init() negotiated, so re-acknowledge it here where every driver
+        // picks it up. This mirrors what the mmio v2 transport does.
+        constexpr uint32_t version1_bit_word1 = static_cast<uint32_t>(VIRTIO_F_VERSION_1 >> 32);
+        uint32_t host_features_word1 = virtio_read_host_feature_word(1);
+        virtio_set_guest_features(1, host_features_word1 & version1_bit_word1);
+    }
+}
+
+status_t virtio_pci_bus::virtio_status_features_ok() {
+    // Legacy (transitional) transport has no FEATURES_OK bit.
+    if (legacy_) {
+        return NO_ERROR;
+    }
+    if (common_config()->device_status & VIRTIO_STATUS_FEATURES_OK) {
+        return NO_ERROR;
+    }
+
+    // Set FEATURES_OK and read it back, since the device clears it to reject the
+    // negotiated feature set.
+    common_config()->device_status |= VIRTIO_STATUS_FEATURES_OK;
+    if (!(common_config()->device_status & VIRTIO_STATUS_FEATURES_OK)) {
+        common_config()->device_status |= VIRTIO_STATUS_FAILED;
+        printf("virtio-pci: device rejected feature negotiation\n");
+        return ERR_NOT_SUPPORTED;
+    }
+
+    return NO_ERROR;
 }
 
 void virtio_pci_bus::virtio_status_driver_ok() {
-    // Modern virtio requires confirming feature negotiation before DRIVER_OK:
-    // set FEATURES_OK and read it back, since the device may clear it to reject
-    // the negotiated feature set.
-    if (!legacy_ && !(common_config()->device_status & VIRTIO_STATUS_FEATURES_OK)) {
-        common_config()->device_status |= VIRTIO_STATUS_FEATURES_OK;
-        if (!(common_config()->device_status & VIRTIO_STATUS_FEATURES_OK)) {
-            common_config()->device_status |= VIRTIO_STATUS_FAILED;
-            printf("virtio-pci: device rejected feature negotiation\n");
-            return;
-        }
+    if (virtio_status_features_ok() != NO_ERROR) {
+        return;
     }
 
     common_config()->device_status |= VIRTIO_STATUS_DRIVER_OK;
@@ -192,6 +215,14 @@ void virtio_pci_bus::virtio_kick(uint16_t ring_index) {
     // Ensure descriptors and avail index writes are globally visible before notifying.
     mb();
     *notify = ring_index;
+}
+
+uint16_t virtio_pci_bus::virtio_queue_max_size(uint16_t queue_sel) {
+    auto *ccfg = common_config();
+
+    // queue_size reads back as the device's maximum until the driver writes it
+    ccfg->queue_select = queue_sel;
+    return ccfg->queue_size;
 }
 
 void virtio_pci_bus::register_ring(uint32_t page_size, uint32_t queue_sel, uint32_t queue_num, uint32_t queue_align, uint32_t queue_pfn) {
@@ -276,6 +307,17 @@ handler_return virtio_pci_bus::virtio_pci_irq(void *arg) {
     LTRACEF("exiting irq\n");
 
     return ret;;
+}
+
+void virtio_pci_bus::unmap_bars() {
+    for (auto &bar_map : bar_map_) {
+#if WITH_KERNEL_VM
+        if (bar_map.mapped) {
+            vmm_free_region(vmm_get_kernel_aspace(), reinterpret_cast<vaddr_t>(bar_map.vaddr));
+        }
+#endif
+        bar_map = {};
+    }
 }
 
 status_t virtio_pci_bus::init(virtio_device *dev, pci_location_t loc, size_t index) {
@@ -370,10 +412,13 @@ common:
             char str[32];
             snprintf(str, sizeof(str), "virtio%zu bar%d", index, i);
             err = vmm_alloc_physical(vmm_get_kernel_aspace(), str, bars[i].size, reinterpret_cast<void **>(&bar_map.vaddr), 0,
-                                     bars[i].addr, /* vmm_flags */ 0, ARCH_MMU_FLAG_UNCACHED_DEVICE);
+                                     bars[i].addr, /* vmm_flags */ 0,
+                                     ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE | ARCH_MMU_FLAG_UNCACHED_DEVICE);
             if (err != NO_ERROR) {
-                printf("error mapping bar %d\n", i);
-                continue;
+                printf("virtio-pci: error %d mapping bar %d (addr %#" PRIx64 " size %#zx)\n",
+                       err, i, bars[i].addr, bars[i].size);
+                unmap_bars();
+                return err;
             }
             bar_map.mapped = true;
             LTRACEF("bar %d mapped at %p\n", i, bar_map.vaddr);
@@ -456,21 +501,24 @@ static status_t init_block(pci_location_t loc, const virtio_pci_devices &dev_tab
 #if WITH_DEV_VIRTIO_BLOCK
     // create a virtio_pci_bus object and initialize it based on the location
     auto *bus = new virtio_pci_bus();
-    auto *dev = new virtio_device(bus);
+    auto dev = std::make_unique<virtio_device>(bus);
 
-    auto err = bus->init(dev, loc, index);
+    auto err = bus->init(dev.get(), loc, index);
     if (err != NO_ERROR) {
-        delete bus;
+        // the device destructor deletes the bus it owns
         return err;
     }
 
     // TODO: move the config pointer getter that devices use into the bus
     dev->set_config_ptr(bus->device_config());
 
-    err = virtio_block_init(dev);
+    err = virtio_block_init(dev.get());
     if (err != NO_ERROR) {
         PANIC_UNIMPLEMENTED;
     }
+
+    // the device lives for the lifetime of the system from here on
+    dev.release();
 
     return err;
 #else
@@ -484,21 +532,24 @@ static status_t init_net(pci_location_t loc, const virtio_pci_devices &dev_table
 #if WITH_DEV_VIRTIO_NET
     // create a virtio_pci_bus object and initialize it based on the location
     auto *bus = new virtio_pci_bus();
-    auto *dev = new virtio_device(bus);
+    auto dev = std::make_unique<virtio_device>(bus);
 
-    auto err = bus->init(dev, loc, index);
+    auto err = bus->init(dev.get(), loc, index);
     if (err != NO_ERROR) {
-        delete bus;
+        // the device destructor deletes the bus it owns
         return err;
     }
 
     // TODO: move the config pointer getter that devices use into the bus
     dev->set_config_ptr(bus->device_config());
 
-    err = virtio_net_init(dev);
+    err = virtio_net_init(dev.get());
     if (err != NO_ERROR) {
         PANIC_UNIMPLEMENTED;
     }
+
+    // the device lives for the lifetime of the system from here on
+    dev.release();
 
     return err;
 #else
@@ -512,23 +563,26 @@ static status_t init_gpu(pci_location_t loc, const virtio_pci_devices &dev_table
 #if WITH_DEV_VIRTIO_GPU
     // create a virtio_pci_bus object and initialize it based on the location
     auto *bus = new virtio_pci_bus();
-    auto *dev = new virtio_device(bus);
+    auto dev = std::make_unique<virtio_device>(bus);
 
-    auto err = bus->init(dev, loc, index);
+    auto err = bus->init(dev.get(), loc, index);
     if (err != NO_ERROR) {
-        delete bus;
+        // the device destructor deletes the bus it owns
         return err;
     }
 
     // TODO: move the config pointer getter that devices use into the bus
     dev->set_config_ptr(bus->device_config());
 
-    err = virtio_gpu_init(dev);
+    err = virtio_gpu_init(dev.get());
     if (err != NO_ERROR) {
         PANIC_UNIMPLEMENTED;
     }
 
-    virtio_gpu_start(dev);
+    virtio_gpu_start(dev.get());
+
+    // the device lives for the lifetime of the system from here on
+    dev.release();
 
     return err;
 #else
@@ -541,20 +595,23 @@ static status_t init_rng(pci_location_t loc, const virtio_pci_devices &dev_table
 
 #if WITH_DEV_VIRTIO_RNG
     auto *bus = new virtio_pci_bus();
-    auto *dev = new virtio_device(bus);
+    auto dev = std::make_unique<virtio_device>(bus);
 
-    auto err = bus->init(dev, loc, index);
+    auto err = bus->init(dev.get(), loc, index);
     if (err != NO_ERROR) {
-        delete bus;
+        // the device destructor deletes the bus it owns
         return err;
     }
 
     dev->set_config_ptr(bus->device_config());
 
-    err = virtio_rng_init(dev);
+    err = virtio_rng_init(dev.get());
     if (err != NO_ERROR) {
         PANIC_UNIMPLEMENTED;
     }
+
+    // the device lives for the lifetime of the system from here on
+    dev.release();
 
     return err;
 #else

@@ -25,9 +25,11 @@
 #include <dev/virtio/virtio-device.h>
 #include <dev/virtio/9p.h>
 #include <kernel/event.h>
+#include <kernel/spinlock.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <stdlib.h>
 
 #if WITH_KERNEL_VM
@@ -41,9 +43,12 @@
 static status_t pdu_init(struct p9_fcall *pdu, size_t size)
 {
 #if WITH_KERNEL_VM
+    // PDUs are handed to the device through the virtqueue, so like the ring itself they
+    // must be ordinary cached memory rather than a Device mapping. See the comment in
+    // virtio_device::virtio_alloc_ring() for why a Device mapping breaks under KVM.
     vmm_alloc_contiguous(vmm_get_kernel_aspace(), "virtio_9p_pdu", size,
                          (void **)&pdu->sdata, 0, 0,
-                         ARCH_MMU_FLAG_UNCACHED_DEVICE);
+                         ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
 #else
     pdu->sdata = (uint8_t*)malloc(size);
 #endif
@@ -77,13 +82,17 @@ static status_t p9_req_prepare(struct p9_req *req,
 {
     struct virtio_9p_dev *p9dev = containerof(req, struct virtio_9p_dev, req);
     status_t ret = NO_ERROR;
+    auto cleanup = lk::make_auto_call([req] {
+        pdu_fini(&req->tc);
+        pdu_fini(&req->rc);
+    });
 
     if ((ret = pdu_init(&req->tc, p9dev->msize)) != NO_ERROR) {
-        goto err;
+        return ret;
     }
 
     if ((ret = pdu_init(&req->rc, p9dev->msize)) != NO_ERROR) {
-        goto err;
+        return ret;
     }
 
     pdu_reset(&req->tc);
@@ -94,23 +103,17 @@ static status_t p9_req_prepare(struct p9_req *req,
 
     // fill 9p header
     if (pdu_writed(&req->tc, 0) != NO_ERROR) {
-        ret = ERR_IO;
-        goto err;
+        return ERR_IO;
     }
     if (pdu_writeb(&req->tc, tmsg->msg_type) != NO_ERROR) {
-        ret = ERR_IO;
-        goto err;
+        return ERR_IO;
     }
     if (pdu_writew(&req->tc, tmsg->tag) != NO_ERROR) {
-        ret = ERR_IO;
-        goto err;
+        return ERR_IO;
     }
 
+    cleanup.cancel();
     return NO_ERROR;
-err:
-    pdu_fini(&req->tc);
-    pdu_fini(&req->rc);
-    return ret;
 }
 
 static void p9_req_release(struct p9_req *req)
@@ -168,7 +171,7 @@ static void virtio_9p_req_send(struct virtio_9p_dev *p9dev,
     struct vring_desc *desc;
     uint16_t idx;
 
-    arch_interrupt_saved_state_t state = spin_lock_irqsave(&p9dev->lock);
+    AutoSpinLock lock_guard(&p9dev->lock);
 
     desc = dev->virtio_alloc_desc_chain(VIRTIO_9P_RING_IDX, 2, &idx);
 
@@ -197,8 +200,6 @@ static void virtio_9p_req_send(struct virtio_9p_dev *p9dev,
 
     /* kick it off */
     dev->bus()->virtio_kick(VIRTIO_9P_RING_IDX);
-
-    spin_unlock_irqrestore(&p9dev->lock, state);
 }
 
 status_t virtio_9p_rpc(struct virtio_device *dev, const virtio_9p_msg_t *tmsg,
@@ -218,13 +219,14 @@ status_t virtio_9p_rpc(struct virtio_device *dev, const virtio_9p_msg_t *tmsg,
     // level lock for restricting only one rpc can be executed at a time. One
     // day if we can support multiple outstanding requests, we should move the
     // lock into the request allocation phase.
-    mutex_acquire(&p9dev->req_lock);
+    AutoLock req_lock_guard(&p9dev->req_lock);
 
     // prepare the message header
     ret = p9_req_prepare(req, tmsg);
     if (ret != NO_ERROR) {
-        goto req_unlock;
+        return ret;
     }
+    auto cleanup = lk::make_auto_call([req] { p9_req_release(req); });
 
     // setup the T-message by its msg-type
     switch (tmsg->msg_type) {
@@ -270,24 +272,23 @@ status_t virtio_9p_rpc(struct virtio_device *dev, const virtio_9p_msg_t *tmsg,
         default:
             LTRACEF("9p T-message type not supported: %u\n", tmsg->msg_type);
             ret = ERR_NOT_SUPPORTED;
-            goto err;
+            return ret;
     }
 
     if (ret != NO_ERROR) {
         LTRACEF("9p T-message (code: %u) failed: %d\n", tmsg->msg_type, ret);
-        goto err;
+        return ret;
     }
 
     if ((ret = p9_req_finalize(req)) != NO_ERROR) {
-        goto err;
+        return ret;
     }
 
     virtio_9p_req_send(p9dev, req);
 
     // wait for server's response
     if (event_wait_timeout(&req->io_event, VIRTIO_9P_RPC_TIMEOUT) != NO_ERROR) {
-        ret = ERR_TIMED_OUT;
-        goto err;
+        return ERR_TIMED_OUT;
     }
 
     // read the message header from the returned request
@@ -340,14 +341,8 @@ status_t virtio_9p_rpc(struct virtio_device *dev, const virtio_9p_msg_t *tmsg,
         default:
             LTRACEF("9p R-message type not supported: %u\n", tmsg->msg_type);
             ret = ERR_NOT_SUPPORTED;
-            goto err;
+            return ret;
     }
-
-err:
-    p9_req_release(req);
-
-req_unlock:
-    mutex_release(&p9dev->req_lock);
 
     return ret;
 }

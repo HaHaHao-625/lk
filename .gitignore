@@ -1,14 +1,17 @@
 *.dSYM
 *.orig
+*.pyc
 *.swp
 *~
 .cache
 .cache
+.claude
 .clangd
 .mypy_cache
 .rsync-filter
 .vscode
 TAGS
+__pycache__/
 blk*.bin*
 build-*
 buildall.log

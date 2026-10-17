@@ -7,6 +7,9 @@
  */
 
 #include "device.h"
+#include "resource.h"
+#include "root.h"
+#include "bus.h"
 #include "arch/mmu.h"
 
 #include <assert.h>
@@ -17,6 +20,7 @@
 #include <lk/list.h>
 #include <lk/pow2.h>
 #include <lk/trace.h>
+#include <memory>
 #include <platform/interrupts.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,12 +103,11 @@ status_t device::probe(pci_location_t loc, bus *parent_bus, device **out_device)
     LTRACEF_LEVEL(2, "type %#hhx\n", header_type);
 
     // create a new device and pass it up
-    device *d = new device(loc, parent_bus);
+    auto d = std::make_unique<device>(loc, parent_bus);
 
     // try to read in the basic config space for this device
     err = d->load_config();
     if (err < 0) {
-        delete d;
         return err;
     }
 
@@ -115,7 +118,7 @@ status_t device::probe(pci_location_t loc, bus *parent_bus, device **out_device)
     d->probe_capabilities();
 
     // return the newly constructed device
-    *out_device = d;
+    *out_device = d.release();
 
     return NO_ERROR;
 }
@@ -303,8 +306,35 @@ status_t device::allocate_irq(uint *irq) {
         return err;
     }
 
-    if (interrupt_pin == 0) {
+    if (interrupt_pin == 0 || interrupt_pin > 4) {
         return ERR_NO_RESOURCES;
+    }
+
+    // If the root knows how to route legacy interrupts (ACPI _PRT and the like), describe where
+    // we sit relative to the root bus and ask it.
+    root *r = bus_->get_root();
+    if (r && r->has_intx_route()) {
+        // count the hops from the root bus down to us, then fill in the path top down
+        size_t depth = 1;
+        for (bus *b = bus_; !b->is_root_bus(); b = b->get_bridge()->parent_bus()) {
+            depth++;
+        }
+        constexpr size_t max_depth = 32; // no sane topology nests bridges this deep
+        if (depth <= max_depth) {
+            pci_intx_path_entry path[max_depth];
+            size_t i = depth;
+            path[--i] = { loc().dev, loc().fn };
+            for (bus *b = bus_; !b->is_root_bus(); b = b->get_bridge()->parent_bus()) {
+                path[--i] = { b->get_bridge()->loc().dev, b->get_bridge()->loc().fn };
+            }
+            DEBUG_ASSERT(i == 0);
+
+            err = r->route_intx(path, depth, interrupt_pin, irq);
+            if (err == NO_ERROR) {
+                return NO_ERROR;
+            }
+            LTRACEF("root failed to route interrupt (%d), falling back to config space line\n", err);
+        }
     }
 
     // Prefer the already-routed legacy IRQ line from PCI config space.
@@ -442,7 +472,7 @@ status_t device::allocate_msix(size_t num_requested, uint *msi_base) {
     LTRACEF("table offset %#zx, bar %u\n", table_map.offset, table_map.bar);
     LTRACEF("pba offset %#zx, bar %u\n", pba_map.offset, pba_map.bar);
 
-    auto map_it = [this, &err](mapping &map, void **ptr, bool readonly) -> status_t {
+    auto map_it = [this](mapping &map, void **ptr, bool readonly) -> status_t {
         const auto &bar = bars_[map.bar];
 #if WITH_KERNEL_VM
         if (!bar.valid || bar.io) {
@@ -454,12 +484,13 @@ status_t device::allocate_msix(size_t num_requested, uint *msi_base) {
         size_t length = ROUNDUP(map.length + map.offset - base, PAGE_SIZE);
         base += bar.addr;
 
-        err = vmm_alloc_physical(vmm_get_kernel_aspace(), "pci msix var", length, ptr, 0,
+        status_t map_err = vmm_alloc_physical(vmm_get_kernel_aspace(), "pci msix var", length, ptr, 0,
                                  base, /* vmm_flags */ 0,
-                                 ARCH_MMU_FLAG_UNCACHED_DEVICE | (readonly ? ARCH_MMU_FLAG_PERM_RO : 0));
-        if (err != NO_ERROR) {
+                                 ARCH_MMU_FLAG_UNCACHED_DEVICE | ARCH_MMU_FLAG_PERM_READ |
+                                 (readonly ? 0 : ARCH_MMU_FLAG_PERM_WRITE));
+        if (map_err != NO_ERROR) {
             printf("error mapping msi-x bar\n");
-            return err;
+            return map_err;
         }
         LTRACEF("msi-x bar mapped at %p\n", *ptr);
 #else
@@ -526,6 +557,17 @@ status_t device::allocate_msix(size_t num_requested, uint *msi_base) {
     return NO_ERROR;
 }
 
+// Compute a bar's size from the value read back after writing all 1s to it. The size is the
+// lowest set bit of the masked readback, which unlike inverting the readback stays correct on
+// devices that hardwire the top bits of the register to zero (common on 16 bit io decoders).
+static uint64_t bar_size_from_probe(uint64_t probe, uint64_t mask) {
+    probe &= mask;
+    if (probe == 0) {
+        return 0;
+    }
+    return probe & ~(probe - 1);
+}
+
 status_t device::load_bars() {
     size_t num_bars;
 
@@ -546,7 +588,17 @@ status_t device::load_bars() {
 
     uint16_t command;
     pci_read_config_half(loc(), PCI_CONFIG_COMMAND, &command);
-    pci_write_config_half(loc(), PCI_CONFIG_COMMAND, command & ~(PCI_COMMAND_IO_EN | PCI_COMMAND_MEM_EN));
+    status_t err = pci_write_config_half(loc(), PCI_CONFIG_COMMAND,
+                                         command & ~(PCI_COMMAND_IO_EN | PCI_COMMAND_MEM_EN));
+    if (err != NO_ERROR) {
+        // Sizing a bar requires writing to it. Without working config writes the probe below
+        // would read back the untouched address and compute a nonsense size from it, so fail
+        // here instead of handing garbage to a driver.
+        char str[14];
+        printf("PCI: cannot write config space for device %s, unable to probe bars\n",
+               pci_loc_string(loc(), str));
+        return err;
+    }
 
     for (size_t i = 0; i < num_bars; i++) {
         bars_[i] = {};
@@ -560,12 +612,11 @@ status_t device::load_bars() {
 
             // probe size by writing all 1s and seeing what bits are masked
             uint32_t size = 0;
-            pci_write_config_word(loc_, PCI_CONFIG_BASE_ADDRESSES + i * 4, 0xffff);
+            pci_write_config_word(loc_, PCI_CONFIG_BASE_ADDRESSES + i * 4, 0xffffffff);
             pci_read_config_word(loc_, PCI_CONFIG_BASE_ADDRESSES + i * 4, &size);
             pci_write_config_word(loc_, PCI_CONFIG_BASE_ADDRESSES + i * 4, bars_[i].addr);
 
-            // mask out bottom bits, invert and add 1 to compute size
-            bars_[i].size = ((size & ~0b11) ^ 0xffff) + 1;
+            bars_[i].size = bar_size_from_probe(size, ~static_cast<uint64_t>(0b11));
 
             bars_[i].valid = (bars_[i].size != 0);
         } else if ((bar_addr & 0b110) == 0b000) {
@@ -581,8 +632,7 @@ status_t device::load_bars() {
             pci_read_config_word(loc_, PCI_CONFIG_BASE_ADDRESSES + i * 4, &size);
             pci_write_config_word(loc_, PCI_CONFIG_BASE_ADDRESSES + i * 4, bars_[i].addr);
 
-            // mask out bottom bits, invert and add 1 to compute size
-            bars_[i].size = (~(size & ~0b1111)) + 1;
+            bars_[i].size = bar_size_from_probe(size, ~static_cast<uint64_t>(0b1111));
 
             bars_[i].valid = (bars_[i].size != 0);
         } else if ((bar_addr & 0b110) == 0b100) {
@@ -610,8 +660,7 @@ status_t device::load_bars() {
             pci_write_config_word(loc_, PCI_CONFIG_BASE_ADDRESSES + i * 4, bars_[i].addr);
             pci_write_config_word(loc_, PCI_CONFIG_BASE_ADDRESSES + i * 4 + 4, bars_[i].addr >> 32);
 
-            // mask out bottom bits, invert and add 1 to compute size
-            bars_[i].size = (~(size & ~static_cast<uint64_t>(0b1111))) + 1;
+            bars_[i].size = bar_size_from_probe(size, ~static_cast<uint64_t>(0b1111));
 
             bars_[i].valid = (bars_[i].size != 0);
 
@@ -659,7 +708,7 @@ status_t device::compute_bar_sizes(bar_sizes *sizes) {
         } else if (bar.size_64 && bar.prefetchable) {
             // 64bit mmio
             auto size = ROUNDUP(bar.size, PAGE_SIZE);
-            auto align = __builtin_ctz(size);
+            auto align = __builtin_ctzll(size);
             sizes->prefetchable64_size += size;
             if (sizes->prefetchable64_align < align) {
                 sizes->prefetchable64_align = align;
@@ -667,7 +716,7 @@ status_t device::compute_bar_sizes(bar_sizes *sizes) {
         } else if (bar.size_64) {
             // 64bit mmio
             auto size = ROUNDUP(bar.size, PAGE_SIZE);
-            auto align = __builtin_ctz(size);
+            auto align = __builtin_ctzll(size);
             sizes->mmio64_size += size;
             if (sizes->mmio64_align < align) {
                 sizes->mmio64_align = align;
@@ -675,7 +724,7 @@ status_t device::compute_bar_sizes(bar_sizes *sizes) {
         } else if (bar.prefetchable) {
             // 64bit prefetchable mmio
             auto size = ROUNDUP(bar.size, PAGE_SIZE);
-            auto align = __builtin_ctz(size);
+            auto align = __builtin_ctzll(size);
             sizes->prefetchable_size += size;
             if (sizes->prefetchable_align < align) {
                 sizes->prefetchable_align = align;
@@ -683,7 +732,7 @@ status_t device::compute_bar_sizes(bar_sizes *sizes) {
         } else {
             // 32bit mmio
             auto size = ROUNDUP(bar.size, PAGE_SIZE);
-            auto align = __builtin_ctz(size);
+            auto align = __builtin_ctzll(size);
             sizes->mmio_size += size;
             if (sizes->mmio_align < align) {
                 sizes->mmio_align = align;
@@ -694,7 +743,32 @@ status_t device::compute_bar_sizes(bar_sizes *sizes) {
     return NO_ERROR;
 }
 
-status_t device::get_bar_alloc_requests(list_node *bar_alloc_requests) {
+status_t device::reserve_assigned_resources(resource_allocator &allocator) {
+    char str[14];
+    LTRACEF("device at %s\n", pci_loc_string(loc(), str));
+
+    // any bar with a non zero address was set up by firmware, keep it out of the allocator
+    for (auto i = 0; i < 6; i++) {
+        const auto &bar = bars_[i];
+        if (!bar.valid || bar.addr == 0) {
+            continue;
+        }
+
+        pci_resource_type type;
+        if (bar.io) {
+            type = PCI_RESOURCE_IO_RANGE;
+        } else if (bar.size_64) {
+            type = PCI_RESOURCE_MMIO64_RANGE;
+        } else {
+            type = PCI_RESOURCE_MMIO_RANGE;
+        }
+        allocator.reserve(type, bar.addr, bar.size);
+    }
+
+    return NO_ERROR;
+}
+
+status_t device::get_bar_alloc_requests(list_node *bar_alloc_requests, pci_assign_mode mode) {
     char str[14];
     LTRACEF("device at %s\n", pci_loc_string(loc(), str));
 
@@ -708,6 +782,11 @@ status_t device::get_bar_alloc_requests(list_node *bar_alloc_requests) {
             continue;
         }
 
+        // firmware already assigned this one and we were asked to keep those
+        if (mode == PCI_ASSIGN_UNASSIGNED && bar.addr != 0) {
+            continue;
+        }
+
         auto request = new bar_alloc_request;
         *request = {};
         request->bridge = false;
@@ -715,14 +794,15 @@ status_t device::get_bar_alloc_requests(list_node *bar_alloc_requests) {
         request->bar_num = i;
 
         if (bar.io) {
-            // io case
-            request->size = ROUNDUP(bar.size, 16);
-            request->align = 4;
+            // io case. bars are naturally aligned to their size, minimum 16 bytes.
+            auto size = ROUNDUP(bar.size, 16);
+            request->size = size;
+            request->align = __builtin_ctzll(size);
             request->type = PCI_RESOURCE_IO_RANGE;
         } else if (bar.size_64) {
             // 64bit mmio
             auto size = ROUNDUP(bar.size, PAGE_SIZE);
-            auto align = __builtin_ctz(size);
+            auto align = __builtin_ctzll(size);
             request->size = size;
             request->align = align;
             request->type = PCI_RESOURCE_MMIO64_RANGE;
@@ -730,7 +810,7 @@ status_t device::get_bar_alloc_requests(list_node *bar_alloc_requests) {
         } else {
             // 32bit mmio
             auto size = ROUNDUP(bar.size, PAGE_SIZE);
-            auto align = __builtin_ctz(size);
+            auto align = __builtin_ctzll(size);
             request->size = size;
             request->align = align;
             request->type = PCI_RESOURCE_MMIO_RANGE;
@@ -750,7 +830,7 @@ status_t device::assign_resource(bar_alloc_request *request, uint64_t address) {
         request->dump();
     }
 
-    DEBUG_ASSERT(IS_ALIGNED(address, (1UL << request->align)));
+    DEBUG_ASSERT(IS_ALIGNED(address, (1ULL << request->align)));
 
     // Note: When assigning the resource, we don't bother setting the bottom bits
     // as those are hardwired per the spec.

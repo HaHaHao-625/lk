@@ -27,6 +27,17 @@ static void dump_region(const vmm_region_t *r);
 
 static status_t vmm_remove_region_locked(vmm_aspace_t *aspace, vaddr_t vaddr, vmm_region_t **r_out);
 
+/* one lock for every aspace today; taking it per aspace leaves room to split it */
+void vmm_aspace_lock(vmm_aspace_t *aspace) {
+    DEBUG_ASSERT(aspace);
+    mutex_acquire(&vmm_lock);
+}
+
+void vmm_aspace_unlock(vmm_aspace_t *aspace) {
+    DEBUG_ASSERT(aspace);
+    mutex_release(&vmm_lock);
+}
+
 void vmm_init_preheap(void) {
     /* initialize the kernel address space */
     strlcpy(_kernel_aspace.name, "kernel", sizeof(_kernel_aspace.name));
@@ -325,6 +336,30 @@ status_t vmm_reserve_space(vmm_aspace_t *aspace, const char *name, size_t size, 
     return r ? NO_ERROR : ERR_NO_MEMORY;
 }
 
+status_t vmm_reserve_range(vmm_aspace_t *aspace, const char *name, size_t size,
+                           uint8_t align_log2, vaddr_t *va) {
+    LTRACEF("aspace %p name '%s' size 0x%zx align %hhu\n", aspace, name, size, align_log2);
+
+    DEBUG_ASSERT(aspace);
+    DEBUG_ASSERT(va);
+
+    if (!name)
+        name = "";
+
+    size = ROUNDUP(size, PAGE_SIZE);
+    if (size == 0)
+        return ERR_INVALID_ARGS;
+
+    mutex_acquire(&vmm_lock);
+    vmm_region_t *r = alloc_region(aspace, name, size, 0, align_log2, 0,
+                                   VMM_REGION_FLAG_RESERVED, ARCH_MMU_FLAG_INVALID);
+    if (r)
+        *va = r->base;
+    mutex_release(&vmm_lock);
+
+    return r ? NO_ERROR : ERR_NO_MEMORY;
+}
+
 status_t vmm_alloc_physical(vmm_aspace_t *aspace, const char *name, size_t size,
                             void **ptr, uint8_t align_log2, paddr_t paddr, uint vmm_flags, uint arch_mmu_flags) {
     status_t err;
@@ -371,7 +406,7 @@ status_t vmm_alloc_physical(vmm_aspace_t *aspace, const char *name, size_t size,
 
     /* map all of the pages */
     err = arch_mmu_map(&aspace->arch_aspace, r->base, paddr, size / PAGE_SIZE, arch_mmu_flags);
-    if (err < NO_ERROR) {
+    if (err != NO_ERROR) {
         LTRACEF("arch_mmu_map returns %d\n", err);
         goto err_free_r;
     }
@@ -452,7 +487,7 @@ status_t vmm_alloc_contiguous(vmm_aspace_t *aspace, const char *name, size_t siz
 
     /* map all of the pages */
     err = arch_mmu_map(&aspace->arch_aspace, r->base, pa, size / PAGE_SIZE, arch_mmu_flags);
-    if (err < NO_ERROR) {
+    if (err != NO_ERROR) {
         LTRACEF("arch_mmu_map returns %d\n", err);
         goto err_free_r;
     }
@@ -517,9 +552,10 @@ status_t vmm_alloc(vmm_aspace_t *aspace, const char *name, size_t size, void **p
     list_initialize(&page_list);
 
     size_t count = pmm_alloc_pages(size / PAGE_SIZE, &page_list);
-    DEBUG_ASSERT(count <= size);
+    DEBUG_ASSERT(count <= size / PAGE_SIZE);
     if (count < size / PAGE_SIZE) {
-        LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", size / PAGE_SIZE, count);
+        LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n",
+                (size_t)(size / PAGE_SIZE), count);
         pmm_free(&page_list);
         err = ERR_NO_MEMORY;
         goto err;
@@ -547,7 +583,7 @@ status_t vmm_alloc(vmm_aspace_t *aspace, const char *name, size_t size, void **p
         DEBUG_ASSERT(IS_PAGE_ALIGNED(pa));
 
         err = arch_mmu_map(&aspace->arch_aspace, va, pa, 1, arch_mmu_flags);
-        if (err < NO_ERROR) { // TODO: deal with difference between 0 and 1 returns in some arches
+        if (err != NO_ERROR) {
             // add the page back to the list so it gets freed
             list_add_tail(&page_list, &p->node);
             goto err2;
@@ -671,6 +707,10 @@ status_t vmm_create_aspace(vmm_aspace_t **_aspace, const char *name, uint flags)
         aspace->base = KERNEL_ASPACE_BASE;
         aspace->size = KERNEL_ASPACE_SIZE;
     } else {
+        if (!arch_mmu_supports_user_aspaces()) {
+            free(aspace);
+            return ERR_NOT_SUPPORTED;
+        }
         aspace->base = USER_ASPACE_BASE;
         aspace->size = USER_ASPACE_SIZE;
     }
@@ -696,6 +736,23 @@ status_t vmm_create_aspace(vmm_aspace_t **_aspace, const char *name, uint flags)
 }
 
 status_t vmm_free_aspace(vmm_aspace_t *aspace) {
+    /* make sure the current thread does not map the aspace */
+    thread_t *current_thread = get_current_thread();
+    if (current_thread->aspace == aspace) {
+        THREAD_LOCK(state);
+        current_thread->aspace = NULL;
+        vmm_context_switch(aspace, NULL);
+        THREAD_UNLOCK(state);
+    }
+
+    /* Another cpu still running on it would be left walking tables that are
+     * about to be freed; whoever holds it has to switch away first. A thread
+     * that merely references it but is not running is fine: its cpu unloaded
+     * the aspace when it switched away. */
+    if (arch_aspace_active_cpus(&aspace->arch_aspace) != 0) {
+        return ERR_BUSY;
+    }
+
     /* pop it out of the global aspace list */
     mutex_acquire(&vmm_lock);
     if (!list_in_list(&aspace->node)) {
@@ -726,15 +783,6 @@ status_t vmm_free_aspace(vmm_aspace_t *aspace) {
         free(r);
     }
 
-    /* make sure the current thread does not map the aspace */
-    thread_t *current_thread = get_current_thread();
-    if (current_thread->aspace == aspace) {
-        THREAD_LOCK(state);
-        current_thread->aspace = NULL;
-        vmm_context_switch(aspace, NULL);
-        THREAD_UNLOCK(state);
-    }
-
     /* destroy the arch portion of the aspace */
     arch_mmu_destroy_aspace(&aspace->arch_aspace);
 
@@ -747,7 +795,8 @@ status_t vmm_free_aspace(vmm_aspace_t *aspace) {
 void vmm_context_switch(vmm_aspace_t *oldspace, vmm_aspace_t *newaspace) {
     DEBUG_ASSERT(thread_lock_held());
 
-    arch_mmu_context_switch(newaspace ? &newaspace->arch_aspace : NULL);
+    arch_mmu_context_switch(oldspace ? &oldspace->arch_aspace : NULL,
+                            newaspace ? &newaspace->arch_aspace : NULL);
 }
 
 vmm_aspace_t* vmm_set_active_aspace(vmm_aspace_t *aspace) {
@@ -817,20 +866,24 @@ usage:
         if (argc < 4) goto notenoughargs;
 
         void *ptr = (void *)0x99;
-        status_t err = vmm_alloc(test_aspace, "alloc test", argv[2].u, &ptr, argv[3].u, 0, 0);
+        status_t err = vmm_alloc(test_aspace, "alloc test", argv[2].u, &ptr, argv[3].u, 0,
+                                 ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
         printf("vmm_alloc returns %d, ptr %p\n", err, ptr);
     } else if (!strcmp(argv[1].str, "alloc_physical")) {
         if (argc < 4) goto notenoughargs;
 
         void *ptr = (void *)0x99;
         status_t err = vmm_alloc_physical(test_aspace, "physical test", argv[3].u, &ptr,
-                                          argv[4].u, argv[2].u, 0, ARCH_MMU_FLAG_UNCACHED_DEVICE);
+                                          argv[4].u, argv[2].u, 0,
+                                          ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE |
+                                          ARCH_MMU_FLAG_UNCACHED_DEVICE);
         printf("vmm_alloc_physical returns %d, ptr %p\n", err, ptr);
     } else if (!strcmp(argv[1].str, "alloc_contig")) {
         if (argc < 4) goto notenoughargs;
 
         void *ptr = (void *)0x99;
-        status_t err = vmm_alloc_contiguous(test_aspace, "contig test", argv[2].u, &ptr, argv[3].u, 0, 0);
+        status_t err = vmm_alloc_contiguous(test_aspace, "contig test", argv[2].u, &ptr, argv[3].u, 0,
+                                            ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
         printf("vmm_alloc_contig returns %d, ptr %p\n", err, ptr);
     } else if (!strcmp(argv[1].str, "free_region")) {
         if (argc < 2) goto notenoughargs;

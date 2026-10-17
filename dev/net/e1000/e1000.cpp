@@ -6,6 +6,7 @@
 // https://opensource.org/licenses/MIT
 
 #include <arch/atomic.h>
+#include <arch/ops.h>
 #include <dev/bus/pci.h>
 #include <kernel/event.h>
 #include <kernel/thread.h>
@@ -19,11 +20,58 @@
 #include <lk/list.h>
 #include <lk/reg.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <platform/interrupts.h>
 #include <string.h>
 
 #include "e1000_hw.h"
 #include "e1000_ids.h"
+
+// NOTE ON CACHE COHERENCY
+//
+// This driver assumes DMA is cache coherent. That holds on every bus it is reachable on today
+// (PCI on x86, and PCIe on the arm64 qemu virt machine), so the descriptor rings and the packet
+// buffers are ordinary cached memory and ordering is done with barriers alone: wmb() before the
+// TDT/RDT doorbells, rmb() after the TDH/RDH reads and after observing RXD_STAT_DD.
+//
+// The rings used to be mapped uncached with no barriers at all. That had to change because an
+// uncached guest mapping is broken under KVM on an ARM core without FEAT_S2FWB (ARMv8.4): the
+// guest's uncached accesses and the VMM's cached view of the same page never see each other.
+// See the comment in virtio_device::virtio_alloc_ring().
+//
+// A real e1000 behind a non-coherent interconnect -- an actual ARM SoC rather than an emulated
+// PCIe device -- would need more than barriers, and this driver does not do any of it:
+//
+//   - TX: the packet data and the descriptor have to be cleaned to the point of coherency before
+//     the TDT write, and the descriptor invalidated before its writeback status is read.
+//   - RX: the buffer and the descriptor have to be invalidated before they are read, so the DMA'd
+//     data is not shadowed by a stale line.
+//   - The descriptor rings would have to stop being cached, or be padded. rdesc and tdesc are 16
+//     bytes, so four share a 64 byte line, and invalidating a line to pick up one descriptor's
+//     writeback would discard driver writes to the three next to it. Keeping the rings uncached,
+//     which is what they were before, is the usual answer -- and it directly conflicts with what
+//     KVM on ARM needs, so a port to a non-coherent target would have to make the mapping a
+//     platform choice rather than the constant it is here.
+//
+// The buffers are at least shaped for it already: the rx buffers are cache line aligned 2048 byte
+// slices of one allocation, and pktbuf pool objects are cache line aligned and a whole number of
+// lines long, so no buffer shares a line with another one.
+//
+// Two things are missing before any of that could be written, and neither is local to this file:
+//
+//   - A Normal Non-cacheable memory attribute. Both of the uncached arch mmu flags are Device
+//     types (ARCH_MMU_FLAG_UNCACHED is Device-nGnRnE, ARCH_MMU_FLAG_UNCACHED_DEVICE is
+//     Device-nGnRE; see MMU_MAIR_VAL in arch/arm64/include/arch/arm64/mmu.h), and Device is the
+//     wrong tool for a ring: it forbids speculation, preserves access size, requires strict
+//     alignment and cannot merge writes, all of which are there for MMIO and merely slow here.
+//     Linux allocates non-coherent DMA memory as Normal Non-cacheable for exactly this reason
+//     (arm64's pgprot_dmacoherent()); LK has no such MAIR entry to allocate against.
+//
+//   - A per device notion of whether DMA is coherent, rather than one answer compiled into each
+//     driver. That is what lets one driver source work on both kinds of system: firmware says
+//     which it is (`dma-coherent` in a device tree, _CCA in ACPI) and the allocation and the
+//     maintenance follow from that. Note qemu sets `dma-coherent` on the root node of the virt
+//     machine's tree, so a guest that honored it would arrive at what this driver hardcodes.
 
 #define LOCAL_TRACE 0
 
@@ -77,8 +125,10 @@ class e1000 {
 
     handler_return irq_handler();
 
-    void add_pktbuf_to_rxring(pktbuf_t *pkt);
     void add_pktbuf_to_rxring_locked(pktbuf_t *pkt);
+    void refill_rxring_locked();
+    void rx_buf_returned(void *buf);
+    static void rx_buf_free_cb(void *buf, void *arg, bool reschedule);
 
     // counter of configured deices
     static volatile int global_count_;
@@ -104,11 +154,10 @@ class e1000 {
     uint8_t *rx_buf_ = nullptr; // rxbuffer_len * rxring_len byte buffer that rx_pktbuf[] points to
     pktbuf_t *rx_pending_pkt_ = nullptr;
 
-    // rx worker thread
-    list_node rx_queue_ = LIST_INITIAL_VALUE(rx_queue_);
-    event_t rx_event_ = EVENT_INITIAL_VALUE(rx_event_, 0, EVENT_FLAG_AUTOUNSIGNAL);
-    thread_t *rx_worker_thread_ = nullptr;
-    int rx_worker_routine();
+    // rx buffer slices returned by the stack that could not be re-armed yet
+    // because the pktbuf header pool was empty (a list_node lives in the
+    // first bytes of each free slice)
+    list_node free_rx_bufs_ = LIST_INITIAL_VALUE(free_rx_bufs_);
 
     // tx ring
     tdesc *txring_ = nullptr;
@@ -196,6 +245,9 @@ handler_return e1000::irq_handler() {
 
     LTRACEF("icr %#x\n", icr);
 
+    // frames completed this pass, handed to the stack after the lock drops
+    list_node done = LIST_INITIAL_VALUE(done);
+
     AutoSpinLockNoIrqSave guard(&lock_);
 
     handler_return ret = INT_NO_RESCHEDULE;
@@ -203,6 +255,8 @@ handler_return e1000::irq_handler() {
     if (icr & E1000_ICR_TXDW) { // TXDW - transmit descriptor written back
         // Walk from last known head to current TDH, freeing completed TX pktbufs.
         auto tdh = read_reg(e1000_reg::TDH);
+        // Order the descriptor and pktbuf accesses below after the TDH read.
+        rmb();
         while (tx_last_head_ != tdh) {
             if (tx_pktbuf_[tx_last_head_]) {
                 pktbuf_free(tx_pktbuf_[tx_last_head_], false);
@@ -233,6 +287,9 @@ handler_return e1000::irq_handler() {
         // Packets may be ready, or descriptors may need draining after overrun.
         auto rdh = read_reg(e1000_reg::RDH);
         auto rdt = read_reg(e1000_reg::RDT);
+        // The ring is normal cached memory, so the descriptor reads below have to be
+        // explicitly ordered after these register reads.
+        rmb();
 
         while (rx_last_head_ != rdh) {
             // copy the current rx descriptor locally for better cache performance
@@ -251,6 +308,10 @@ handler_return e1000::irq_handler() {
 
             bool consumed_pkt = false;
             if (rxd.status & E1000_RXD_STAT_DD) { // descriptor done, we own it now
+                // DD is what tells us the device has finished writing the buffer, so the
+                // reads of the received data have to be ordered after observing it.
+                rmb();
+
                 bool eop = (rxd.status & E1000_RXD_STAT_EOP);
 
                 if (rxd.errors == 0) {
@@ -270,9 +331,8 @@ handler_return e1000::irq_handler() {
                             if (eop) {
                                 // Packet is now complete.
                                 rx_pending_pkt_->flags |= PKTBUF_FLAG_EOF;
-                                list_add_tail(&rx_queue_, &rx_pending_pkt_->list);
+                                list_add_tail(&done, &rx_pending_pkt_->list);
                                 rx_pending_pkt_ = nullptr;
-                                event_signal(&rx_event_, false);
                                 ret = INT_RESCHEDULE;
                             }
                         } else {
@@ -286,8 +346,7 @@ handler_return e1000::irq_handler() {
                         pkt->dlen = rxd.length;
                         if (eop) {
                             pkt->flags |= PKTBUF_FLAG_EOF;
-                            list_add_tail(&rx_queue_, &pkt->list);
-                            event_signal(&rx_event_, false);
+                            list_add_tail(&done, &pkt->list);
                             ret = INT_RESCHEDULE;
                             consumed_pkt = true;
                         } else {
@@ -313,53 +372,70 @@ handler_return e1000::irq_handler() {
 
             rx_last_head_ = (rx_last_head_ + 1) % rxring_len;
         }
+
+        // re-arm any slots whose buffers have come back from the stack
+        // (also retries earlier header pool failures)
+        refill_rxring_locked();
     }
+
+    guard.release();
+
+    // hand completed frames to the stack; it owns them from here and the
+    // buffer slices come back through rx_buf_free_cb
+    pktbuf_t *p;
+    while ((p = list_remove_head_type(&done, pktbuf_t, list)) != nullptr) {
+        minip_rx_pktbuf(&netif_, p);
+    }
+
     return ret;
 }
 
-int e1000::rx_worker_routine() {
-    for (;;) {
-        event_wait(&rx_event_);
+// A buffer slice handed to the stack has been freed; queue it for re-arming.
+// Runs wherever the last reference is dropped (typically the netstack worker).
+void e1000::rx_buf_returned(void *buf) {
+    AutoSpinLock guard(&lock_);
 
-        // pull some packets from the received queue
-        for (;;) {
-            pktbuf_t *p;
+    list_node *node = static_cast<list_node *>(buf);
+    list_add_tail(&free_rx_bufs_, node);
 
-            {
-                AutoSpinLock guard(&lock_);
+    refill_rxring_locked();
+}
 
-                p = list_remove_head_type(&rx_queue_, pktbuf_t, list);
-            }
+void e1000::rx_buf_free_cb(void *buf, void *arg, bool reschedule) {
+    static_cast<e1000 *>(arg)->rx_buf_returned(buf);
+}
 
-            if (!p) {
-                break; // nothing left in the queue, go back to waiting
-            }
-
-            if (LOCAL_TRACE) {
-                LTRACEF("got packet: ");
-                pktbuf_dump(p);
-            }
-
-            // push it up the stack
-            minip_rx_driver_callback(&netif_, p);
-
-            // we own the pktbuf again
-
-            // set the data pointer to the start of the buffer and set dlen to 0
-            pktbuf_reset(p, 0);
-
-            // add it back to the rx ring at the current tail
-            add_pktbuf_to_rxring(p);
+// Wrap queued free slices in fresh pktbuf headers and put them back on the
+// rx ring. If the header pool is empty the slices stay queued and are
+// retried on the next irq or free. Called with lock_ held.
+void e1000::refill_rxring_locked() {
+    while (!list_is_empty(&free_rx_bufs_)) {
+        pktbuf_t *pkt = pktbuf_alloc_empty();
+        if (!pkt) {
+            break;
         }
-    }
 
-    return 0;
+        list_node *node = list_remove_head(&free_rx_bufs_);
+        pktbuf_add_buffer(pkt, reinterpret_cast<u8 *>(node), rxbuffer_len, 0, 0,
+                          &e1000::rx_buf_free_cb, this);
+        add_pktbuf_to_rxring_locked(pkt);
+    }
 }
 
 int e1000::tx(pktbuf_t *p) {
     LTRACE;
     if (LOCAL_TRACE) {
         pktbuf_dump(p);
+    }
+
+    AutoSpinLock guard(&lock_);
+
+    // if the slot at the tail still holds a pktbuf the ring is full
+    if (tx_pktbuf_[tx_tail_] != nullptr) {
+        guard.release();
+        TRACEF("tx ring full, dropping packet\n");
+        pktbuf_free(p, true);
+        return ERR_NO_MEMORY;
     }
 
     // build a tx descriptor and stuff it in the tx ring
@@ -372,8 +448,10 @@ int e1000::tx(pktbuf_t *p) {
     // save a copy of the pktbuf in our list
     tx_pktbuf_[tx_tail_] = p;
 
-    // bump tail forward
+    // bump tail forward. The descriptor and the packet it points at must be visible to the
+    // device before the tail register hands the descriptor over.
     tx_tail_ = (tx_tail_ + 1) % txring_len;
+    wmb();
     write_reg(e1000_reg::TDT, tx_tail_);
 
     LTRACEF("TDH %#x TDT %#x\n", read_reg(e1000_reg::TDH), read_reg(e1000_reg::TDT));
@@ -394,17 +472,13 @@ void e1000::add_pktbuf_to_rxring_locked(pktbuf_t *p) {
     // save a copy of the pktbuf in our list
     rx_pktbuf_[rx_tail_] = p;
 
-    // bump tail forward
+    // bump tail forward. The descriptor must be visible to the device before the tail
+    // register hands it over.
     rx_tail_ = (rx_tail_ + 1) % rxring_len;
+    wmb();
     write_reg(e1000_reg::RDT, rx_tail_);
 
     LTRACEF("after RDH %#x RDT %#x\n", read_reg(e1000_reg::RDH), read_reg(e1000_reg::RDT));
-}
-
-void e1000::add_pktbuf_to_rxring(pktbuf_t *pkt) {
-    AutoSpinLock guard(&lock_);
-
-    add_pktbuf_to_rxring_locked(pkt);
 }
 
 status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
@@ -435,7 +509,8 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
     // map bar 0, main memory mapped register interface, 128KB
     snprintf(str, sizeof(str), "e1000 %d bar0", unit_);
     err = vmm_alloc_physical(vmm_get_kernel_aspace(), str, 128 * 1024, &bar0_regs_, 0, bars[0].addr,
-                             /* vmm_flags */ 0, ARCH_MMU_FLAG_UNCACHED_DEVICE);
+                             /* vmm_flags */ 0,
+                             ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE | ARCH_MMU_FLAG_UNCACHED_DEVICE);
     if (err != NO_ERROR) {
         return ERR_NOT_FOUND;
     }
@@ -480,10 +555,13 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
     printf("e1000 %d: mac address %02x:%02x:%02x:%02x:%02x:%02x\n", unit_, mac_addr_[0],
            mac_addr_[1], mac_addr_[2], mac_addr_[3], mac_addr_[4], mac_addr_[5]);
 
-    // allocate and map space for the rx and tx ring
+    // Allocate and map space for the rx and tx ring. Mapped cached, with the barriers around the
+    // head/tail registers doing the ordering; see the note on cache coherency at the top of this
+    // file for what that assumes.
     snprintf(str, sizeof(str), "e1000 %d rxring", unit_);
     err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, rxring_len * sizeof(rdesc),
-                               reinterpret_cast<void **>(&rxring_), 0, 0, ARCH_MMU_FLAG_UNCACHED);
+                               reinterpret_cast<void **>(&rxring_), 0, 0,
+                               ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
     if (err != NO_ERROR) {
         return ERR_NOT_FOUND;
     }
@@ -494,11 +572,12 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
 
     snprintf(str, sizeof(str), "e1000 %d txring", unit_);
     err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, txring_len * sizeof(tdesc),
-                               reinterpret_cast<void **>(&txring_), 0, 0, ARCH_MMU_FLAG_UNCACHED);
+                               reinterpret_cast<void **>(&txring_), 0, 0,
+                               ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
     if (err != NO_ERROR) {
         return ERR_NOT_FOUND;
     }
-    memset(txring_, 0, txring_len * sizeof(rdesc));
+    memset(txring_, 0, txring_len * sizeof(tdesc));
 
     paddr_t txring_phys = vaddr_to_paddr(txring_);
     LTRACEF("tx ring at %p, physical %#lx\n", txring_, txring_phys);
@@ -506,7 +585,8 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
     // allocate a large array of contiguous buffers to receive into
     snprintf(str, sizeof(str), "e1000 %d rx buffers", unit_);
     err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, rxring_len * rxbuffer_len,
-                               reinterpret_cast<void **>(&rx_buf_), 0, 0, 0);
+                               reinterpret_cast<void **>(&rx_buf_), 0, 0,
+                               ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
     if (err != NO_ERROR) {
         return ERR_NOT_FOUND;
     }
@@ -596,29 +676,29 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
         }
     }
 
-    // fill the rx ring with pktbufs
+    // construct the minip netif before enabling the receiver so early
+    // frames have somewhere to go (registration happens at the end)
+    snprintf(str, sizeof(str), "e1000-%d", unit_);
+    netif_create(&netif_, str);
+    auto tx = [](void *arg, pktbuf_t *p) -> int {
+        auto *e = static_cast<e1000 *>(arg);
+        DEBUG_ASSERT(e);
+        return e->tx(p);
+    };
+    netif_set_eth(&netif_, tx, this, mac_addr_);
+
+    // fill the rx ring: queue every buffer slice and let the refill logic
+    // wrap each in a pktbuf header
     rx_last_head_ = read_reg(e1000_reg::RDH);
     rx_tail_ = read_reg(e1000_reg::RDT);
     for (size_t i = 0; i < rxring_len - 1; i++) {
-        // construct a 2K pktbuf, pointing outo our rx_buf_ block of memory
-        auto *pkt = pktbuf_alloc_empty();
-        if (!pkt) {
-            break;
-        }
-        pktbuf_add_buffer(pkt, rx_buf_ + i * rxbuffer_len, rxbuffer_len, 0, 0, nullptr, nullptr);
-
-        add_pktbuf_to_rxring_locked(pkt);
+        list_add_tail(&free_rx_bufs_, reinterpret_cast<list_node *>(rx_buf_ + i * rxbuffer_len));
+    }
+    {
+        AutoSpinLock guard(&lock_);
+        refill_rxring_locked();
     }
     // hexdump(rxring_, rxring_len * sizeof(rdesc));
-
-    // start rx worker thread
-    auto wrapper_lambda = [](void *arg) -> int {
-        e1000 *e = static_cast<e1000 *>(arg);
-        return e->rx_worker_routine();
-    };
-    snprintf(str, sizeof(str), "e1000 %d rx worker", unit_);
-    rx_worker_thread_ = thread_create(str, wrapper_lambda, this, HIGH_PRIORITY, DEFAULT_STACK_SIZE);
-    thread_resume(rx_worker_thread_);
 
     // start receiver
     // enable RX, unicast permiscuous, multicast permiscuous, broadcast accept, BSIZE 2048
@@ -671,16 +751,7 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
     ims = read_reg(e1000_reg::IMS);
     write_reg(e1000_reg::IMS, ims | E1000_ICR_TXQE | E1000_ICR_TXDW);
 
-    // register this NIC instance with minip's netif layer
-    snprintf(str, sizeof(str), "e1000-%d", unit_);
-    netif_create(&netif_, str);
-    auto tx = [](void *arg, pktbuf_t *p) -> int {
-        auto *e = static_cast<e1000 *>(arg);
-        DEBUG_ASSERT(e);
-        return e->tx(p);
-    };
-
-    netif_set_eth(&netif_, tx, this, mac_addr_);
+    // register this NIC instance with minip's netif layer, bringing it up
     netif_register(&netif_);
 
     // add to list of instances

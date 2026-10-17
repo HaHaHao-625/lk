@@ -5,6 +5,8 @@ MODULE_OPTIONS := extra_warnings
 
 MODULE_SRCS += $(LOCAL_DIR)/pool_test.cpp
 
+MODULE_DEPS += lib/libcpp
+MODULE_DEPS += lib/pool
 MODULE_DEPS += lib/unittest
 
 include make/module.mk

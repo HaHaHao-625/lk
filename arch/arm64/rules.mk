@@ -43,6 +43,12 @@ MODULE_SRCS += \
 
 ARM64_PAGE_SIZE ?= 4096
 
+# Set to 1 to run user address spaces on one shared ASID with a flush per switch,
+# the way an 8 bit ASID cpu is handled, even when the cpu implements 16 bits.
+# Only useful for testing that path; qemu always reports 16 bits.
+ARM64_ASID_FALLBACK ?= 0
+GLOBAL_DEFINES += ARM64_ASID_FALLBACK=$(ARM64_ASID_FALLBACK)
+
 # platform/target/project is allowed to override the page size the kernel
 # and user space will run at.
 ifeq ($(ARM64_PAGE_SIZE), 4096)
@@ -94,6 +100,8 @@ GLOBAL_DEFINES += \
 	MEMBASE=$(MEMBASE) \
 	MEMSIZE=$(MEMSIZE)
 
+CLANG_ARCH_TRIPLE ?= aarch64-elf
+
 # try to find the toolchain
 include $(LOCAL_DIR)/toolchain.mk
 TOOLCHAIN_PREFIX := $(ARCH_$(ARCH)_TOOLCHAIN_PREFIX)
@@ -105,9 +113,6 @@ ARCH_COMPILEFLAGS_NOFLOAT := -mgeneral-regs-only
 ARCH_COMPILEFLAGS_FLOAT :=
 
 ARCH_LDFLAGS += -z max-page-size=$(ARM64_PAGE_SIZE)
-
-# Note: assumes the use of gcc and the user is not overriding CC which is set later in engine.mk
-LIBGCC := $(shell $(TOOLCHAIN_PREFIX)gcc $(GLOBAL_COMPILEFLAGS) $(ARCH_COMPILEFLAGS) -print-libgcc-file-name)
 
 # make sure some bits were set up
 MEMVARS_SET := 0
@@ -136,5 +141,7 @@ linkerscript.phony:
 .PHONY: linkerscript.phony
 
 MODULE_OPTIONS := extra_warnings
+
+MODULE_WEAK_DEPS += dev/interrupt/arm_gic
 
 include make/module.mk

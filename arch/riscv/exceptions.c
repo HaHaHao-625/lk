@@ -6,12 +6,19 @@
  * https://opensource.org/licenses/MIT
  */
 #include <assert.h>
+#include <lk/backtrace.h>
 #include <lk/compiler.h>
+#include <lk/err.h>
 #include <lk/trace.h>
+#include <arch/ops.h>
 #include <arch/riscv.h>
 #include <kernel/thread.h>
 #include <platform.h>
 #include <arch/riscv/iframe.h>
+#if RISCV_MMU
+#include <arch/riscv/mmu.h>
+#include <kernel/vm.h>
+#endif
 
 #define LOCAL_TRACE 0
 
@@ -90,6 +97,9 @@ static void dump_iframe(struct riscv_short_iframe *frame, bool kernel) {
         // gp/tp/sp are not modified when taking a kernel to kernel exception
         printf("gp %#16lx tp %#16lx (from registers)\n", gp, tp);
     }
+    printf("s0 %#16lx ra %#16lx\n", frame->s0, frame->ra);
+
+    backtrace_print(frame->epc, frame->s0);
 }
 
 __NO_RETURN __NO_INLINE
@@ -106,13 +116,78 @@ static void fatal_exception(long cause, ulong epc, struct riscv_short_iframe *fr
     platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_PANIC);
 }
 
-// weak reference, can override this somewhere else
+void riscv_syscall_unhandled(struct riscv_short_iframe *frame) {
+    printf("unhandled syscall from user space in thread %s\n", get_current_thread()->name);
+    dump_iframe(frame, false);
+    thread_exit(ERR_NOT_SUPPORTED);
+}
+
+void riscv_user_exception_unhandled(long cause, ulong epc, struct riscv_short_iframe *frame) {
+    printf("unhandled exception from user space in thread %s: cause %#lx (%s), epc %#lx, tval %#lx\n",
+           get_current_thread()->name, cause, cause_to_string(cause), epc,
+           riscv_csr_read(RISCV_CSR_XTVAL));
+    dump_iframe(frame, false);
+    thread_exit(ERR_FAULT);
+}
+
+// weak references, overridable by whatever hosts user space. Both run in
+// trap context on the thread's kernel stack with interrupts disabled;
+// returning resumes user space at frame->epc.
 __WEAK
 void riscv_syscall_handler(struct riscv_short_iframe *frame) {
-    printf("unhandled syscall handler\n");
-    dump_iframe(frame, false);
-    platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_PANIC);
+    riscv_syscall_unhandled(frame);
 }
+
+__WEAK
+void riscv_user_exception(long cause, ulong epc, struct riscv_short_iframe *frame) {
+    riscv_user_exception_unhandled(cause, epc, frame);
+}
+
+#if RISCV_MMU
+// A page fault the tables do not explain is a translation this hart cached
+// before the entry was made valid: drop everything the hart holds and let the
+// access run again. Returns false for a fault that is real.
+//
+// The same instruction faulting on the same address over and over is not
+// stale whatever the tables say: after the fence the next walk is definite,
+// and the window Svvptc allows is short. Past a small count the fault is
+// reported as real, so a wrong verdict ends in a diagnosable fault rather than
+// a hart that spins in the handler. One record per cpu; this runs with
+// interrupts off.
+struct page_fault_retry {
+    ulong epc;
+    vaddr_t addr;
+    long cause;
+    uint count;
+};
+static struct page_fault_retry page_fault_retries[SMP_MAX_CPUS];
+#define PAGE_FAULT_RETRY_LIMIT 16
+
+static bool riscv_page_fault_retry(long cause, ulong epc, const struct riscv_short_iframe *frame) {
+    const vaddr_t addr = riscv_csr_read(RISCV_CSR_XTVAL);
+    vmm_aspace_t *aspace = vaddr_to_aspace((void *)addr);
+    if (!aspace || !riscv_mmu_fault_is_stale(&aspace->arch_aspace, addr, cause, frame->status)) {
+        return false;
+    }
+
+    struct page_fault_retry *r = &page_fault_retries[arch_curr_cpu_num()];
+    if (r->epc == epc && r->addr == addr && r->cause == cause) {
+        if (++r->count > PAGE_FAULT_RETRY_LIMIT) {
+            printf("page fault at %#lx (epc %#lx, cause %ld) still stale after %u retries, treating as real\n",
+                   addr, epc, cause, r->count - 1);
+            r->count = 0;
+            return false;
+        }
+    } else {
+        *r = (struct page_fault_retry){ .epc = epc, .addr = addr, .cause = cause, .count = 1 };
+    }
+
+    LTRACEF("stale translation for %#lx, cause %ld\n", addr, cause);
+    // the everything form: a cached invalid link to a table is only dropped by that one
+    riscv_tlb_flush_all();
+    return true;
+}
+#endif
 
 // called from assembly
 void riscv_exception_handler(long cause, ulong epc, struct riscv_short_iframe *frame, bool kernel);
@@ -143,10 +218,32 @@ void riscv_exception_handler(long cause, ulong epc, struct riscv_short_iframe *f
         // all synchronous traps go here
         switch (cause) {
             case RISCV_EXCEPTION_ENV_CALL_U_MODE: // ecall from user mode
+                // resume past the ecall, which is always 4 bytes even with the C
+                // extension; the handler may still move epc elsewhere
+                frame->epc += 4;
                 riscv_syscall_handler(frame);
                 break;
+#if RISCV_MMU
+            case RISCV_EXCEPTION_INS_PAGE_FAULT:
+            case RISCV_EXCEPTION_LOAD_PAGE_FAULT:
+            case RISCV_EXCEPTION_STORE_PAGE_FAULT:
+                if (riscv_page_fault_retry(cause, epc, frame)) {
+                    break;
+                }
+                if (!kernel) {
+                    riscv_user_exception(cause, epc, frame);
+                } else {
+                    fatal_exception(cause, epc, frame, kernel);
+                }
+                break;
+#endif
             default:
-                fatal_exception(cause, epc, frame, kernel);
+                // anything else user space did is its own problem, not the kernel's
+                if (!kernel) {
+                    riscv_user_exception(cause, epc, frame);
+                } else {
+                    fatal_exception(cause, epc, frame, kernel);
+                }
         }
     }
 
