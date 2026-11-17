@@ -16,7 +16,7 @@ __BEGIN_CDECLS
 // The wait queue is the basis for all locking primitives.
 // It is a simple FIFO queue of threads that are blocked waiting for some
 // condition to be met.  The wait queue is used by mutexes, semaphores,
-// condition variables, and other synchronization primitives.
+// events, ports and thread_join().
 //
 // The wait queue is not a general purpose queue, it is only used for
 // blocking threads.  It is not intended to be used for other purposes.
@@ -51,6 +51,17 @@ void wait_queue_destroy(wait_queue_t *, bool reschedule);
 // A timeout other than INFINITE_TIME will set abort after the specified time
 // and return ERR_TIMED_OUT. A timeout of 0 will immediately return.
 status_t wait_queue_block(wait_queue_t *, lk_time_t timeout);
+
+// Flags for wait_queue_block_etc() and the other _etc waits built on it.
+//
+// WAIT_QUEUE_INTERRUPTIBLE: a kill signal (thread_signal_kill()) ends the wait
+// with ERR_INTERRUPTED, or refuses it with ERR_INTERRUPTED if already pending,
+// and the caller unwinds. For waits that may last a while: a thread killed in
+// any other wait finishes it first.
+#define WAIT_QUEUE_INTERRUPTIBLE (1u << 0)
+
+// wait_queue_block() with flags; wait_queue_block() is flags 0.
+status_t wait_queue_block_etc(wait_queue_t *, lk_time_t timeout, uint flags);
 
 // Release one or more threads from the wait queue.
 // reschedule = should the system reschedule if any is released.

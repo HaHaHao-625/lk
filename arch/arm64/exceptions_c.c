@@ -189,6 +189,19 @@ __WEAK void arm64_user_exception(struct arm64_iframe_long *iframe, uint32_t esr,
     arm64_user_exception_unhandled(iframe, esr, far);
 }
 
+__WEAK void arm64_user_kill(void) {
+    thread_exit(ERR_INTERRUPTED);
+}
+
+/* The last stop before EL0, whatever the exception was: a thread killed while
+ * it ran, slept or sat preempted ends here instead of going back. */
+void arm64_el0_return_check(void);
+void arm64_el0_return_check(void) {
+    if (unlikely(thread_signals(get_current_thread()) & THREAD_SIGNAL_KILL)) {
+        arm64_user_kill();
+    }
+}
+
 void arm64_sync_exception(struct arm64_iframe_long *iframe);
 void arm64_sync_exception(struct arm64_iframe_long *iframe) {
     struct fault_handler_table_entry *fault_handler;
@@ -203,16 +216,8 @@ void arm64_sync_exception(struct arm64_iframe_long *iframe) {
             return;
         case 0b010001: /* syscall from arm32 */
         case 0b010101: /* syscall from arm64 */
-#ifdef WITH_LIB_SYSCALL
-            void arm64_syscall(struct arm64_iframe_long *iframe);
-            arch_enable_fiqs();
-            arm64_syscall(iframe);
-            arch_disable_fiqs();
-            return;
-#else
             arm64_syscall(iframe, (ec == 0x15) ? true : false);
             return;
-#endif
         default:
             break;
     }

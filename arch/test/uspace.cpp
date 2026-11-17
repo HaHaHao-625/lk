@@ -11,8 +11,10 @@
  * enters it with arch_enter_uspace(), and the arch's user exception hooks,
  * overridden here, record what came back and end the thread. Covers the
  * lower-EL/U-mode entry and exit paths, the syscall hook, a user access to
- * kernel memory being caught rather than crashing the kernel, and
- * arch_mmu_protect() taking effect for user stores and fetches.
+ * kernel memory being caught rather than crashing the kernel,
+ * arch_mmu_protect() taking effect for user stores and fetches, a kill
+ * ending a thread that spins in user mode or has yet to enter it, and on arm64
+ * FIQs staying masked through all of it.
  */
 
 #if ARCH_ARM64 || (ARCH_RISCV && RISCV_S_MODE && RISCV_MMU)
@@ -20,6 +22,7 @@
 #include <arch.h>
 #include <arch/mmu.h>
 #include <arch/ops.h>
+#include <kernel/mp.h>
 #include <kernel/thread.h>
 #include <kernel/vm.h>
 #include <lib/unittest.h>
@@ -39,6 +42,7 @@ extern "C" const uint8_t uspace_stub_syscall_start[], uspace_stub_syscall_end[];
 extern "C" const uint8_t uspace_stub_fault_start[], uspace_stub_fault_end[];
 extern "C" const uint8_t uspace_stub_store_start[], uspace_stub_store_target[], uspace_stub_store_end[];
 extern "C" const uint8_t uspace_stub_jump_start[], uspace_stub_jump_target[], uspace_stub_jump_end[];
+extern "C" const uint8_t uspace_stub_spin_start[], uspace_stub_spin_end[];
 
 namespace {
 
@@ -54,6 +58,7 @@ constexpr uint kX = ARCH_MMU_FLAG_PERM_EXECUTE;
 volatile bool test_active;
 volatile int syscalls;
 volatile ulong syscall_arg;
+volatile ulong syscall_spsr; // arm64 only
 volatile int faults;
 volatile ulong fault_cause; // arm64: ESR, riscv: scause
 volatile ulong fault_addr;  // arm64: FAR, riscv: stval
@@ -149,6 +154,7 @@ bool user_env_run(const user_env &env, int *retcode) {
 
     syscalls = 0;
     syscall_arg = 0;
+    syscall_spsr = 0;
     faults = 0;
     fault_cause = 0;
     fault_addr = 0;
@@ -191,6 +197,9 @@ bool user_syscall() {
     EXPECT_EQ(1, syscalls, "syscalls seen");
     EXPECT_EQ(kSyscallMagic, syscall_arg, "syscall argument");
     EXPECT_EQ(0, faults, "faults seen");
+#if ARCH_ARM64
+    EXPECT_TRUE(BIT(syscall_spsr, 6), "FIQs masked in user mode");
+#endif
 
     END_TEST;
 }
@@ -286,6 +295,101 @@ bool user_protect() {
     END_TEST;
 }
 
+// Kill a thread spinning in user mode on cpu. It is killed while preempted (cpu
+// is this one) or while running (another cpu, interrupted by the kill); either
+// way it meets the signal on its way back to user mode, and the arch's default
+// kill hook ends it with ERR_INTERRUPTED.
+bool kill_spinning_user_thread(const user_env &env, uint cpu) {
+    BEGIN_TEST;
+
+    uspace_thread_args args = { .env = &env };
+    thread_t *t = thread_create("uspace_kill", uspace_thread, &args, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+    ASSERT_NONNULL(t, "thread_create");
+    thread_set_pinned_cpu(t, cpu);
+    thread_resume(t);
+    // time to reach user mode; a kill sent before that is met at the entry instead
+    thread_sleep(20);
+    thread_signal_kill(t);
+
+    int retcode = 0;
+    ASSERT_EQ(NO_ERROR, thread_join(t, &retcode, 5000), "the kill ends the thread");
+    EXPECT_EQ(ERR_INTERRUPTED, retcode, "exit code set by the kill hook");
+
+    END_TEST;
+}
+
+bool user_kill() {
+    BEGIN_TEST;
+
+    user_env env;
+    ASSERT_TRUE(user_env_setup(&env), "setup");
+    ASSERT_TRUE(user_env_load(&env, uspace_stub_spin_start, uspace_stub_spin_end), "load");
+
+    const uint here = arch_curr_cpu_num();
+    EXPECT_TRUE(kill_spinning_user_thread(env, here), "preempted on this cpu");
+    for (uint cpu = 0; cpu < SMP_MAX_CPUS; cpu++) {
+        if (cpu != here && mp_is_cpu_active(cpu)) {
+            EXPECT_TRUE(kill_spinning_user_thread(env, cpu), "running on another cpu");
+            break;
+        }
+    }
+
+    // a cpu that ran the thread may still be switching away from the aspace
+    status_t err;
+    for (int i = 0; (err = vmm_free_aspace(env.as)) == ERR_BUSY && i < 100; i++) {
+        thread_sleep(1);
+    }
+    EXPECT_EQ(NO_ERROR, err, "free aspace");
+    env.as = nullptr;
+
+    END_TEST;
+}
+
+// A thread killed before it runs never reaches user mode: arch_enter_uspace()
+// hands it to the kill hook, so the syscall its stub opens with is never made.
+bool user_kill_before_entry() {
+    BEGIN_TEST;
+
+    test_active = true;
+    auto done = lk::make_auto_call([]() { test_active = false; });
+
+    user_env env;
+    ASSERT_TRUE(user_env_setup(&env), "setup");
+    ASSERT_TRUE(user_env_load(&env, uspace_stub_syscall_start, uspace_stub_syscall_end), "load");
+
+    syscalls = 0;
+    uspace_thread_args args = { .env = &env };
+    thread_t *t = thread_create("uspace_kill", uspace_thread, &args, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+    ASSERT_NONNULL(t, "thread_create");
+    thread_set_pinned_cpu(t, arch_curr_cpu_num());
+    thread_signal_kill(t);
+    thread_resume(t);
+
+    int retcode = 0;
+    ASSERT_EQ(NO_ERROR, thread_join(t, &retcode, 5000), "join");
+    EXPECT_EQ(ERR_INTERRUPTED, retcode, "exit code set by the kill hook");
+    EXPECT_EQ(0, syscalls, "syscalls seen");
+
+    // the thread is gone, so no cpu has the aspace loaded any more
+    EXPECT_EQ(NO_ERROR, vmm_free_aspace(env.as), "free aspace");
+    env.as = nullptr;
+
+    END_TEST;
+}
+
+#if ARCH_ARM64
+// PSTATE.F is not switched with the thread, so the kernel never unmasks FIQs.
+// Runs last: the exceptions from EL0, kills and thread switches above must
+// have left this cpu as they found it.
+bool kernel_fiqs_masked() {
+    BEGIN_TEST;
+
+    EXPECT_TRUE(arch_fiqs_disabled(), "FIQs masked at EL1");
+
+    END_TEST;
+}
+#endif
+
 } // namespace
 
 // The hooks are weak in the arch; these strong definitions take over for the
@@ -298,6 +402,7 @@ void arm64_syscall(struct arm64_iframe_long *iframe, bool is_64bit) {
     }
     syscalls = syscalls + 1;
     syscall_arg = iframe->r[0];
+    syscall_spsr = iframe->spsr;
     thread_exit(0);
 }
 
@@ -338,6 +443,11 @@ BEGIN_TEST_CASE(arch_uspace_tests)
 RUN_TEST(user_syscall);
 RUN_TEST(user_fault);
 RUN_TEST(user_protect);
+RUN_TEST(user_kill);
+RUN_TEST(user_kill_before_entry);
+#if ARCH_ARM64
+RUN_TEST(kernel_fiqs_masked);
+#endif
 END_TEST_CASE(arch_uspace_tests)
 
 #endif // ARCH_ARM64 || (ARCH_RISCV && RISCV_S_MODE && RISCV_MMU)

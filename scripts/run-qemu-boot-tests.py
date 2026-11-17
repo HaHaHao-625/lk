@@ -76,6 +76,12 @@ class QEMUTestRunner:
                 'args': '',
                 'timeout': 90
             },
+            # supervisor mode with sv32 paging and user aspaces
+            'riscv32-sv32': {
+                'script': 'do-qemuriscv',
+                'args': '-Ss4',
+                'timeout': 90
+            },
             'riscv64': {
                 'script': 'do-qemuriscv',
                 'args': '-6Ss4',
@@ -154,7 +160,7 @@ class QEMUTestRunner:
         if toolchain in ('clang', 'clang-lld'):
             env['TOOLCHAIN'] = 'clang'
             if toolchain == 'clang-lld':
-                env['LD'] = 'ld.lld'
+                env['LK_LD'] = 'ld.lld'
             # engine.mk picks the LLVM install (CLANG_BINDIR) when it is not set
 
         # Create the QEMU commandline
@@ -420,7 +426,7 @@ def main():
     parser = argparse.ArgumentParser(description='Run LK QEMU tests for multiple architectures')
     parser.add_argument('--arch', choices=['arm', 'arm64', 'arm64-16k', 'arm64-64k',
                                           'arm-m3', 'arm-m4', 'arm-m7',
-                                          'arm-m33', 'arm-m55', 'm68k', 'riscv32', 'riscv64',
+                                          'arm-m33', 'arm-m55', 'm68k', 'riscv32', 'riscv32-sv32', 'riscv64',
                                           'riscv64-nosvvptc', 'riscv64-sv39',
                                           'x86', 'x86-64', 'x86-i440fx', 'x86-64-i440fx',
                                           'x86-64-uefi', 'x86-64-xapic'], action='append',
@@ -444,7 +450,7 @@ def main():
     parser.add_argument('--ubsan', action='store_true',
                         help='build with UBSAN=1 and fail if the run reports any undefined behavior')
     parser.add_argument('--timeout', type=int, default=None, metavar='SECONDS',
-                       help='Override the per-architecture QEMU timeout (default: 30s)')
+                       help='Override the per-architecture QEMU timeout (default: per-architecture, 90s; 120s for x86-64-uefi)')
 
     args = parser.parse_args()
 

@@ -9,7 +9,8 @@ WITH_SMP ?= true
 SMP_MAX_CPUS ?= 8
 LK_HEAP_IMPLEMENTATION ?= dlmalloc
 RISCV_FPU ?= true
-RISCV_EXTENSION_LIST ?= zba zbb zbc zbs
+# the subset real cores commonly have, so the same image also runs under KVM with -cpu host
+RISCV_EXTENSION_LIST ?= zba zbb
 
 ifeq ($(RISCV_MODE),supervisor)
 ifeq ($(SUBARCH),32)
@@ -17,6 +18,16 @@ RISCV_MMU ?= sv32
 else
 RISCV_MMU ?= sv48
 endif
+endif
+
+ifeq ($(RISCV_MMU),sv32)
+# sv32's physmap holds ram alone: map the devices in the bottom 512MB of the
+# physical space (clint, plic, uart, virtio, the poweroff register) at 0xc0000000,
+# leaving the kernel's top 512MB to the vm
+GLOBAL_DEFINES += \
+    RISCV_MMU_PERIPHERAL_BASE_PHYS=0 \
+    RISCV_MMU_PERIPHERAL_BASE_VIRT=0xc0000000 \
+    RISCV_MMU_PERIPHERAL_SIZE=0x20000000
 endif
 
 MODULE_DEPS += lib/cbuf

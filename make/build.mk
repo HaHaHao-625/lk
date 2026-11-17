@@ -16,56 +16,58 @@ $(EXTRA_LINKER_SCRIPTS):
 
 $(OUTBIN): $(OUTELF)
 	$(info generating image: $@)
-	$(NOECHO)$(SIZE) $<
-	$(NOECHO)$(OBJCOPY) -O binary $< $@
+	$(NOECHO)$(LK_SIZE) $<
+	$(NOECHO)$(LK_OBJCOPY) -O binary $< $@
 
 $(OUTELF).hex: $(OUTELF)
 	$(info generating hex file: $@)
-	$(NOECHO)$(OBJCOPY) -O ihex $< $@
+	$(NOECHO)$(LK_OBJCOPY) -O ihex $< $@
 
 $(OUTELF): $(ALLMODULE_OBJS) $(EXTRA_OBJS) $(LINKER_SCRIPT) $(EXTRA_LINKER_SCRIPTS)
 	$(info linking $@)
 ifeq ($(LTO_MODE),off)
-	$(NOECHO)$(SIZE) -t --common $(sort $(ALLMODULE_OBJS)) $(EXTRA_OBJS)
+	$(NOECHO)$(LK_SIZE) -t --common $(sort $(ALLMODULE_OBJS)) $(EXTRA_OBJS)
 endif
-	$(NOECHO)$(LD) $(GLOBAL_LDFLAGS) $(ARCH_LDFLAGS) -d -T $(LINKER_SCRIPT) \
+	$(NOECHO)$(LK_LD) $(GLOBAL_LDFLAGS) $(ARCH_LDFLAGS) -d -T $(LINKER_SCRIPT) \
 		$(addprefix -T,$(EXTRA_LINKER_SCRIPTS)) \
 		$(ALLMODULE_OBJS) $(EXTRA_OBJS) $(LIBGCC) -Map=$(OUTELF).map -o $@
 
+GENERATED += $(OUTELF).map
+
 $(OUTELF).sym: $(OUTELF)
 	$(info generating symbols: $@)
-	$(NOECHO)$(OBJDUMP) -t $< | $(CPPFILT) > $@
+	$(NOECHO)$(LK_OBJDUMP) -t $< | $(LK_CXXFILT) > $@
 	$(NOECHO)echo "# vim: ts=8 nolist nowrap" >> $@
 
 $(OUTELF).sym.sorted: $(OUTELF)
 	$(info generating sorted symbols: $@)
-	$(NOECHO)$(OBJDUMP) -t $< | $(CPPFILT) | sort > $@
+	$(NOECHO)$(LK_OBJDUMP) -t $< | $(LK_CXXFILT) | sort > $@
 	$(NOECHO)echo "# vim: ts=8 nolist nowrap" >> $@
 
 $(OUTELF).lst: $(OUTELF)
 	$(info generating listing: $@)
-	$(NOECHO)$(OBJDUMP) $(ARCH_OBJDUMP_FLAGS) -d $< | $(CPPFILT) > $@
+	$(NOECHO)$(LK_OBJDUMP) $(ARCH_OBJDUMP_FLAGS) -d $< | $(LK_CXXFILT) > $@
 	$(NOECHO)echo "# vim: ts=8 nolist nowrap" >> $@
 
 $(OUTELF).debug.lst: $(OUTELF)
 	$(info generating listing: $@)
 	$(NOECHO){ \
-		$(OBJDUMP) $(ARCH_OBJDUMP_FLAGS) -l -S $< 2>$@.err | $(CPPFILT) > $@; \
+		$(LK_OBJDUMP) $(ARCH_OBJDUMP_FLAGS) -l -S $< 2>"$@.err" | $(LK_CXXFILT) > $@; \
 		rc=$$?; \
-		sed '/: failed to find source/d' $@.err >&2; \
-		rm -f $@.err; \
+		sed '/: failed to find source/d' "$@.err" >&2; \
+		rm -f -- "$@.err"; \
 		exit $$rc; \
 	}
 	$(NOECHO)echo "# vim: ts=8 nolist nowrap" >> $@
 
 $(OUTELF).dump: $(OUTELF)
 	$(info generating objdump: $@)
-	$(NOECHO)$(OBJDUMP) -x $< | $(CPPFILT) > $@
+	$(NOECHO)$(LK_OBJDUMP) -x $< | $(LK_CXXFILT) > $@
 	$(NOECHO)echo "# vim: ts=8 nolist nowrap" >> $@
 
 $(OUTELF).size: $(OUTELF)
 	$(info generating size map: $@)
-	$(NOECHO)$(NM) -S --size-sort $< | $(CPPFILT) > $@
+	$(NOECHO)$(LK_NM) -S --size-sort $< | $(LK_CXXFILT) > $@
 	$(NOECHO)echo "# vim: ts=8 nolist nowrap" >> $@
 
 # generate a list of source files that potentially participate in this build.
@@ -84,6 +86,8 @@ $(BUILDDIR)/include_paths.txt: $(OUTELF)
 	@$(MKDIR)
 	$(info generating $@)
 	$(NOECHO)echo $(subst -I,,$(sort $(GLOBAL_INCLUDES))) | tr ' ' '\n' > $@
+
+GENERATED += $(BUILDDIR)/srcfiles.txt $(BUILDDIR)/include_paths.txt
 
 #include arch/$(ARCH)/compile.mk
 

@@ -1,6 +1,6 @@
 # LK Kernel Development Guide
 
-LK is a small, SMP-aware embedded OS kernel designed for supervisor mode on diverse 32/64-bit architectures. It's used extensively in embedded systems, including Android bootloaders. Written primarily in C and assembly, with a limited C++ subset: `lib/libcpp` provides a curated portion of the C++17 standard library (see `lib/libcpp/include/` for the authoritative list), built with no exceptions, no RTTI, and no dynamic containers. `lib/lktl` is LK's own header-only C++ library (namespace `lk`: the intrusive list, `auto_call`, `function`, `function_ref`); `lk/cpp.h` holds the `DISALLOW_*` macros.
+LK is a small, SMP-aware embedded OS kernel designed for supervisor mode on diverse 32/64-bit architectures. It's used extensively in embedded systems, including Android bootloaders. Written primarily in C and assembly, with a limited C++ subset: `lib/libcpp` provides a curated portion of the C++17 standard library (see `lib/libcpp/include/` for the authoritative list), built with no exceptions, no RTTI, and no dynamic containers. `lib/lktl` is LK's own header-only C++ library (namespace `lk`: the intrusive list, `auto_call`, `function`, `function_ref`, `ref_ptr`); `lk/cpp.h` holds the `DISALLOW_*` macros.
 
 ## Architecture Overview
 
@@ -13,7 +13,7 @@ LK uses a 4-layer modular build system:
      the shared `project/virtual/{test,fs,minip}.mk` fragments and the board's `project/target/*.mk`
    - Projects include other project fragments: `include project/virtual/test.mk`
 
-2. **Target** (`target/*.mk`) - Board-specific configuration combining platform + hardware details
+2. **Target** (`target/<board>/rules.mk`) - Board-specific configuration combining platform + hardware details
    - Defines memory layout: `MEMBASE`, `MEMSIZE`, `KERNEL_BASE`
    - GPIO configs, peripheral addresses for specific boards
 
@@ -77,14 +77,20 @@ make PROJECT=qemu-virt-arm64-test
 # Override heap implementation
 make qemu-virt-arm64-test LK_HEAP_IMPLEMENTATION=cmpctmalloc
 
-# Debug builds (default DEBUG=2, set to 0 for release)
-make qemu-virt-arm64-test DEBUG=0
+# Debug builds (default LK_DEBUG=2, set to 0 for release). LK_DEBUG must be 0-3 and also
+# works from the environment, so through every script (LK_DEBUG=0 scripts/do-qemuarm).
+# Code sees it as LK_DEBUGLEVEL. A bare DEBUG is rejected on the command line or in a
+# makefile and ignored with a warning in the environment, since the name is common for
+# other tools.
+make qemu-virt-arm64-test LK_DEBUG=0
 
 # Build with Clang compiler
 make qemu-virt-arm64-test TOOLCHAIN=clang
 
-# Build with Clang compiler and LLVM LLD linker
-make qemu-virt-arm64-test TOOLCHAIN=clang LD=ld.lld
+# Build with Clang compiler and LLVM LLD linker. Target tools are LK_CC, LK_LD, LK_OBJDUMP,
+# LK_OBJCOPY, LK_CXXFILT, LK_SIZE, LK_NM and LK_STRIP; bare CC, LD etc. are ignored in the
+# environment and rejected on the command line or in a makefile.
+make qemu-virt-arm64-test TOOLCHAIN=clang LK_LD=ld.lld
 
 # Build with Clang + LTO (thin or full; requires ld.lld, which is picked by default)
 make qemu-virt-arm64-test TOOLCHAIN=clang LTO_MODE=thin
@@ -103,13 +109,13 @@ scripts/buildall -q -e -r  # quiet, warnings-as-errors, release builds
 scripts/buildall -c -q     # build all with Clang
 scripts/buildall -l -q     # build all with Clang + LLD
 scripts/buildall -e -d     # also fail on undeclared module header deps (what CI runs)
-scripts/buildall -D 0 -u   # build one specific config: DEBUG=0 with UBSAN=1
+scripts/buildall -D 0 -u   # build one specific config: LK_DEBUG=0 with UBSAN=1
 
 Output will be written to buildall.log. To run the build with full output during the build, omit the -q flag.
 
-Note `buildall` assigns `DEBUG` and `UBSAN` itself, so setting them in the environment
-has no effect. Select the configuration with flags instead: `-D <level>` builds exactly
-that debug level (repeatable), `-r` adds a `DEBUG=0` pass on top of the default one, and
+Note `buildall` assigns `LK_DEBUG` and `UBSAN` itself, so setting them in the environment
+has no effect on it. Select the configuration with flags instead: `-D <level>` builds exactly
+that debug level (repeatable), `-r` adds a `LK_DEBUG=0` pass on top of the default one, and
 `-u` turns on UBSAN. Build directories are suffixed accordingly (`-release`, `-ubsan`),
 so several configurations can coexist in one tree.
 ```
@@ -117,7 +123,7 @@ so several configurations can coexist in one tree.
 The file local.mk is silently included if it exists in the root directory. Additional variables can be defined in this file to customize the build instead of needing to pass them on the command line.
 
 Because the inclusion is silent, it applies to test runs too, and nothing on the command
-line hints that it is in play. A `local.mk` setting `TOOLCHAIN`, `WERROR`, `DEBUG` or
+line hints that it is in play. A `local.mk` setting `TOOLCHAIN`, `WERROR`, `LK_DEBUG` or
 `LK_HEAP_IMPLEMENTATION` changes what `scripts/buildall` and
 `scripts/run-qemu-boot-tests.py` actually exercise, which is a common reason a local result
 disagrees with CI. The customary `?=` form only wins where nothing else sets the variable,
@@ -143,8 +149,8 @@ which toolchain and flags actually applied rather than which ones were typed.
 ### Rust support (`USE_RUST=1`)
 
 Rust is opt-in per project. `qemu-virt-arm64-test`, `pc-x86-64-test`,
-`qemu-virt-riscv32-test`, `qemu-virt-riscv64-test` and `qemu-virt-riscv64-supervisor-test`
-accept `USE_RUST=1`, which includes `project/virtual/rust.mk` and builds the rust crates in
+`qemu-virt-riscv32-test`, `qemu-virt-riscv32-supervisor-test`, `qemu-virt-riscv64-test` and
+`qemu-virt-riscv64-supervisor-test` accept `USE_RUST=1`, which includes `project/virtual/rust.mk` and builds the rust crates in
 the tree (`rust/lk`, `rust/lk-sys`, and anything listed in `RUST_CRATES`) into a single
 staticlib via `lib/rust_support` that is linked into the kernel:
 
@@ -163,7 +169,8 @@ USE_RUST=1 scripts/do-qemuriscv -6      # the do-qemu* scripts pick it up from t
   (the float ABI must match the C side, and it can only be set in the json).
 - The rust init hook prints `*** INIT: lk init` early in boot, which is the quick check
   that the rust code made it into the image. `.github/workflows/github-ci-rust.yml` builds
-  every rust-enabled project with clang/lld and boots the qemu ones.
+  the rust-enabled projects with clang/lld and boots the qemu ones, all but
+  `qemu-virt-riscv32-supervisor-test`.
 
 ### Build output
 
@@ -186,7 +193,8 @@ BUILDROOT=/scratch/lkbuild scripts/do-qemuarm -6
 The scripts read it only from the environment. A `BUILDROOT` passed on the make command
 line, or set with `:=` in `local.mk`, moves make's output but not where the scripts look
 for it. `BUILDROOT ?=` in `local.mk` does nothing, since the top level `makefile` has
-already defaulted it to `.` by then.
+already defaulted it to `.` by then. An empty `BUILDROOT` means `.` in make and the
+scripts alike.
 
 Build artifacts include object files, libraries, executables, and generated headers:
 
@@ -207,6 +215,9 @@ Build artifacts include object files, libraries, executables, and generated head
 - `<module>/module_config.h` - per-module generated header recording its `MODULE_DEPS` and
   `MODULE_WEAK_DEPS`, which `scripts/check-module-deps.py` reads
 - lk-symtab-pass1.elf / lk-symtab-pass2.elf - intermediate links when `lib/symtab` is in the build
+- compile_commands.json - compilation database for clangd/clang-tidy, joined from the
+  `<object>.o.json` entry each compile rule writes beside its object; `make <project> compdb`
+  symlinks `./compile_commands.json` to it (see `docs/getting_started.md`)
 
 Each module is linked into an ELF intermediate file named `<module>.mod.o` via ld -r.
 The module and object file paths follow the same path structure as the source files.
@@ -270,8 +281,9 @@ The do-qemu* scripts auto-build before launching QEMU. Note they default to `dlm
 # --help for the full list.
 ./scripts/run-qemu-boot-tests.py --arch x86-64-uefi
 
-# The other page table geometries: arm64 with 16K and 64K pages, riscv64 with sv39
-./scripts/run-qemu-boot-tests.py --arch arm64-16k --arch arm64-64k --arch riscv64-sv39
+# The other page table geometries: arm64 with 16K and 64K pages, riscv64 with sv39,
+# riscv32 in supervisor mode with sv32 (qemu-virt-riscv32-supervisor-test)
+./scripts/run-qemu-boot-tests.py --arch arm64-16k --arch arm64-64k --arch riscv64-sv39 --arch riscv32-sv32
 
 # Raise the per-architecture timeout for longer suites. The defaults (90s, 120s for
 # x86-64-uefi) are hang detectors, not performance targets; see the table in the script.
@@ -304,7 +316,7 @@ scripts/do-qemuarm -6 -A 'lk.autorun=sleep 5; ut all; poweroff'
   console script.
 - Ending the script with `poweroff` makes QEMU exit once the script is done, which is how
   `scripts/run-qemu-boot-tests.py` drives its runs. Note `poweroff` is only registered when
-  `LK_DEBUGLEVEL > 1` (i.e. the default `DEBUG=2`).
+  `LK_DEBUGLEVEL > 1` (i.e. the default `LK_DEBUG=2`).
 - The script is capped at 511 bytes. On PC targets `platform/pc` copies the multiboot command
   line into a 256 byte buffer, which caps the *entire* command line there.
 - The script runs on the shell app's thread, whose stack size can be overridden with
@@ -337,6 +349,16 @@ from the host with both `fsck.fat` and `mtools`:
 It works on a scratch copy of each image and the in-guest tests clean up after
 themselves, so runs are repeatable without rebuilding the images.
 
+ext2 and rofs have runners of the same shape. `scripts/run-ext2-tests.py` covers 1K and 4K
+block images. `scripts/run-rofs-tests.py` builds images with `scripts/mkrofs.py` at three
+alignments, then links one into the kernel with `lib/fs/rofs/embed` and checks it on the
+read only memory device that registers:
+
+```bash
+./scripts/run-ext2-tests.py
+./scripts/run-rofs-tests.py --arch riscv64
+```
+
 ## Code Conventions
 
 ### Commit Message Style
@@ -359,6 +381,27 @@ Examples from the repository:
 For in-progress (WIP) work on a branch that is intended to be collapsed or merged eventually, a `WIP` prefix is acceptable:
 
 - `WIP [fs][fat]: add mkdir support and tests`
+
+### Keeping documentation current
+
+A change that alters behavior, an API, a build variable, a script flag, a command or where
+files live updates the prose that describes it in the same commit. That prose lives in more
+places than the obvious one:
+
+- `README.md`, this file, and `docs/*.md`
+- per-component READMEs (`lib/uefi/README.md`, `platform/mps2/README.md`,
+  `target/*/README.md`, ...)
+- header comments, module comments and test descriptions
+- `--help`/usage text of the scripts
+
+Search for the old name, flag or path with `rg` across the whole tree rather than trusting
+memory of where it is mentioned, and re-read the surrounding text for statements the change
+made false; appending a new paragraph is not enough. A new document gets a line in
+`docs/index.md`. Finished or abandoned work moves within `docs/todo.md` following the rules
+at the top of that file.
+
+Docs and comments describe the code as it is. The story of a change (what was broken, what
+it used to do) belongs in the commit message, not in a comment or doc.
 
 ### Style enforced by `.clang-format`
 
@@ -408,6 +451,15 @@ the same translation unit stays smaller as a template than through either. `lk::
 `lk::method_cookie_last<&T::m>` are the function pointer to hand a C API that takes a `void *cookie`,
 with the object as the cookie.
 
+#### Reference counting in C++
+
+`lk::ref_counted<T>` (`lktl/ref_ptr.h`) puts an atomic count in the object and `lk::ref_ptr<T>` holds
+one reference in one word. Create with `lk::make_ref<T>(args...)` (nothrow new: check for empty) or
+`lk::adopt_ref(p)`; debug builds assert on a double adopt or on counting a dead object. The last
+release deletes the `T`, or calls `T::destroy(T *)` when the class declares one, which is how a
+hierarchy without virtual functions deletes the concrete type (`lk::static_ref_cast` goes back
+down after a kind check).
+
 #### Registering Console Commands
 
 Commands appear in shell when `app/shell` module is included:
@@ -428,6 +480,14 @@ STATIC_COMMAND_END(mytest);
 Console commands are placed in linker section `"console_cmds"` and auto-registered at runtime.
 
 **Note:** If `lib/console` not in build, these macros expand to nothing and the code should not be emitted.
+
+**Panic shell.** Platforms that set `PLATFORM_SUPPORTS_PANIC_SHELL` drop into a polled shell on the
+debug uart after a panic, running with interrupts off and with whatever locks the crashed thread
+held. It only offers commands registered with `STATIC_COMMAND_MASKED(..., CMD_AVAIL_ALWAYS)` (or
+`CMD_AVAIL_PANIC` for panic-only ones). Mark a command that way only if it takes no locks, does not
+allocate and does not block: a mutex asserts there, and anything reached through ACPI takes one. A
+command that normally needs a lock checks `console_in_panic_shell()` to skip it, or to refuse the
+subcommands that cannot work there; `threads`, `heap`, `pmm` and `vm` are examples.
 
 #### Defining Applications
 
@@ -531,12 +591,13 @@ and CI passes `-d`, so an undeclared dependency fails the gcc CI matrix.
 
 ### Debugging
 
-- Multiple DEBUG build levels, controlled via `DEBUG` make variable:
-  - `DEBUG=0`: no DEBUG_ASSERT, dprintf only for ALWAYS level
-  - `DEBUG=1`: DEBUG_ASSERT enabled, dprintf at INFO and ALWAYS
-  - `DEBUG=2`: DEBUG_ASSERT enabled, dprintf at DEBUG, INFO, ALWAYS
-  - `DEBUG=3`: DEBUG_ASSERT enabled, dprintf at DEBUG, INFO, ALWAYS, some extra runtime checks.
-- 'DEBUG=2' is default
+- Multiple debug build levels, controlled via the `LK_DEBUG` make variable (command line,
+  makefile or environment), which code sees as `LK_DEBUGLEVEL`:
+  - `LK_DEBUG=0`: no DEBUG_ASSERT, dprintf only for ALWAYS level
+  - `LK_DEBUG=1`: DEBUG_ASSERT enabled, dprintf at INFO and ALWAYS
+  - `LK_DEBUG=2`: DEBUG_ASSERT enabled, dprintf at DEBUG, INFO, ALWAYS
+  - `LK_DEBUG=3`: DEBUG_ASSERT enabled, dprintf at DEBUG, INFO, ALWAYS, some extra runtime checks.
+- `LK_DEBUG=2` is the default
 - The do-qemu* scripts have no GDB flag (`-s` is the CPU count). Use `-X` to print the QEMU
   command line, then run it by hand with `-s -S` appended to wait for GDB on :1234.
 - Print output via `printf()` goes to console (UART or QEMU serial)
